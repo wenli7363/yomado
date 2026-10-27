@@ -19,6 +19,10 @@ if (!$CoreOnly) {
     if (!$taskResult.passed) { throw $taskResult.error }
     & $taskDotnet $taskAssembly --smoke-panel "$PSScriptRoot\artifacts\panel-smoke.json"
     Assert-YomadoExit 'Control panel smoke test'
+    $taskLeaseReport = Join-Path $PSScriptRoot 'artifacts\input-lease-smoke.json'
+    & $taskDotnet $taskAssembly --test-input-lease $taskLeaseReport
+    Assert-YomadoExit 'Read-only input lease IPC smoke test'
+    if (!(Get-Content -LiteralPath $taskLeaseReport -Raw | ConvertFrom-Json).passed) { throw 'Input lease IPC smoke test failed.' }
     foreach ($taskTheme in @('light','dark')) {
         & $taskDotnet $taskAssembly --preview-ui "$PSScriptRoot\artifacts\preview-$taskTheme.png" $taskTheme
         Assert-YomadoExit "$taskTheme preview"

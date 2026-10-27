@@ -21,6 +21,8 @@ public partial class MainWindow : Window
     private readonly WeChatRecovery? wechat;
     private readonly ProfileStore? store;
     private readonly List<DisplayProfile> profiles = [];
+    private readonly Dictionary<uint, string> profileMessages = [];
+    private uint? startingSlot;
     private readonly Dictionary<string, ImageSource?> icons = new(StringComparer.OrdinalIgnoreCase);
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly bool preview;
@@ -79,7 +81,22 @@ public partial class MainWindow : Window
         var hint = !payload ? "安装文件不完整，请使用完整 Windows 发布包。" : DriverInstaller.NeedsDevelopmentTrust(AppContext.BaseDirectory) ?
             "本地开发版：首次安装需要信任随包测试证书，并允许 Windows 管理员权限。" : "安装需要管理员权限，Windows 会显示权限提示。";
         model.SetDriverHealth(health, payload, hint);
+        RefreshSavedProfiles(displays);
         Desktop.KeepAwake(displays.Any(display => display.IsYomado));
+    }
+    private void RefreshSavedProfiles(IReadOnlyList<DisplayInfo> displays)
+    {
+        var saved = profiles.Where(profile => !displays.Any(display => display.IsYomado && display.Slot == profile.Slot)).ToArray();
+        foreach (var row in model.SavedProfiles.Where(row => saved.All(profile => profile.Slot != row.Profile.Slot)).ToArray())
+            model.SavedProfiles.Remove(row);
+        for (var index = 0; index < saved.Length; index++)
+        {
+            var profile = saved[index];
+            var row = model.SavedProfiles.SingleOrDefault(row => row.Profile.Slot == profile.Slot);
+            if (row is null) { row = new(profile); model.SavedProfiles.Insert(index, row); }
+            else if (model.SavedProfiles.IndexOf(row) != index) model.SavedProfiles.Move(model.SavedProfiles.IndexOf(row), index);
+            row.Update(profile, model.CanCreateScreens, !busy, startingSlot == profile.Slot, profileMessages.GetValueOrDefault(profile.Slot, ""));
+        }
     }
     private static string CardSignature(ScreenCard card) => $"{card.Display}:{card.Title}:{string.Join('|', card.Applications.Select(row => row.Path + ':' + row.WindowCount))}";
     private nint ThemeMessage(nint window, int message, nint wParam, nint lParam, ref bool handled)
@@ -93,7 +110,7 @@ public partial class MainWindow : Window
     {
         if (busy || preview || readOnlyProbe) return;
         busy = true; model.IsBusy = true; timer.Stop();
-        try { await action(); }
+        try { RefreshSavedProfiles(model.Screens.Select(card => card.Display).ToArray()); await action(); }
         catch (Exception ex) { model.Status = ex.Message; MessageBox.Show(this, ex.Message, "yomado", MessageBoxButton.OK, MessageBoxImage.Warning); }
         finally
         {
@@ -119,9 +136,13 @@ public partial class MainWindow : Window
 
     private Task StartProfile(DisplayProfile profile) => Operation(async () =>
     {
+        startingSlot = profile.Slot; profileMessages.Remove(profile.Slot);
+        RefreshSavedProfiles(model.Screens.Select(card => card.Display).ToArray());
+        try
+        {
         var before = desktop!.GetDisplays();
         if (before.Any(d => d.IsYomado && d.Slot == profile.Slot)) return;
-        if (GeometryPolicy.Physical(before) is null) throw new InvalidOperationException("请先连接可用的实体显示器。");
+        DisplayTopology.RequireExtended(before);
         model.Status = "正在创建虚拟屏…";
         await driver!.CreateAsync(profile);
         DisplayInfo? added = null;
@@ -132,28 +153,47 @@ public partial class MainWindow : Window
             await Task.Delay(100);
         }
         if (added is null) throw new InvalidOperationException("驱动已接收创建请求，但尚未确认屏幕可用。请刷新或关闭此配置后重试。");
+        DisplayTopology.VerifyAddition(before, desktop.GetDisplays(), profile, requirePosition: false);
         DisplayLayout.Append(added, before, desktop);
-        if (added.Bounds.Width != profile.PixelWidth || added.Bounds.Height != profile.PixelHeight)
-            throw new InvalidOperationException("虚拟屏分辨率未获确认，请检查系统显示设置。");
+        added = DisplayTopology.VerifyAddition(before, desktop.GetDisplays(), profile);
         model.Status = profile.HiDpi && Math.Abs(added.Scale - 2) > 0.05 ?
             "虚拟屏已创建，使用 2 倍像素。Windows 缩放可在系统显示设置中调整。" : "虚拟屏已创建，可以移入本次任务的窗口。";
+        }
+        catch (Exception ex) { profileMessages[profile.Slot] = ex.Message; throw; }
+        finally { startingSlot = null; }
     });
 
-    private async Task StopProfile(DisplayProfile profile)
+    private async Task<bool> StopProfile(DisplayProfile profile)
     {
         await driver!.EnsureConnectedAsync();
-        var display = desktop!.GetDisplays().SingleOrDefault(d => d.IsYomado && d.Slot == profile.Slot);
-        if (display is not null)
+        var before = desktop!.GetDisplays();
+        var display = before.SingleOrDefault(d => d.IsYomado && d.Slot == profile.Slot);
+        if (display is null)
         {
-            EnsureOnPhysical();
-            model.Status = "正在恢复窗口…";
-            await Task.Run(() => { wechat!.RecoverDisplay(display.Id); workspace!.RefreshOrigins(); workspace.RestoreDisplay(display.Id); });
+            if (!driver.GetConnectedSlots().Contains(profile.Slot)) return true;
+            throw new InvalidOperationException("驱动中的虚拟屏尚未出现在显示清单，无法核对待恢复窗口，请稍后刷新重试。");
         }
+        EnsureOnPhysical();
+        model.Status = "正在恢复窗口…";
+        await Task.Run(() => { wechat!.RecoverDisplay(display.Id); workspace!.RefreshOrigins(); workspace.RestoreDisplay(display.Id); });
+        var offered = await Task.Run(() => workspace!.InspectClose(display.Id));
+        var confirmed = false;
+        if (offered.Windows.Count > 0)
+        {
+            ShowPanel();
+            confirmed = MessageBox.Show(this,
+                $"{profile.DisplayName} 中仍有不能自动移回的对话框或其他窗口：\n\n{offered.Summary}\n\n继续会移除这块虚拟屏，这些窗口的位置由 Windows 处理。可取消后手动处理窗口。是否继续？",
+                "关闭前确认", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes;
+            if (!confirmed) { model.Status = "已取消关闭，虚拟屏已保留。"; return false; }
+        }
+        DisplayTopology.VerifyUnchanged(before, desktop.GetDisplays());
+        workspace!.VerifyClose(offered, confirmed);
         driver!.Remove(profile.Slot);
         for (var retry = 0; retry < 40; retry++)
         {
-            if (!desktop.GetDisplays().Any(d => d.IsYomado && d.Slot == profile.Slot) && !driver.GetConnectedSlots().Contains(profile.Slot))
-            { model.Status = "窗口已恢复，虚拟屏已关闭。"; return; }
+            var after = desktop.GetDisplays();
+            if (!after.Any(d => d.IsYomado && d.Slot == profile.Slot) && !driver.GetConnectedSlots().Contains(profile.Slot))
+            { DisplayTopology.VerifyRemoval(before, after, display.Id); model.Status = "虚拟屏已关闭，实体屏与其他工作屏保持原排列。"; return true; }
             await Task.Delay(100);
         }
         throw new InvalidOperationException("窗口已恢复，屏幕移除尚未获确认。请刷新后重试。");
@@ -161,37 +201,63 @@ public partial class MainWindow : Window
 
     private void AddClicked(object sender, RoutedEventArgs e)
     {
-        if (busy || preview) return;
+        if (busy || preview || readOnlyProbe) return;
         if (!model.DriverReady) { model.Status = "请先点击一键安装驱动，等待驱动就绪后再创建虚拟屏。"; return; }
-        var menu = new ContextMenu(); var displays = desktop!.GetDisplays();
-        foreach (var profile in profiles.Where(p => !displays.Any(d => d.IsYomado && d.Slot == p.Slot)))
+        NewProfile();
+    }
+    private async void StartSavedProfileClicked(object sender, RoutedEventArgs e)
+    {
+        if (busy || preview || readOnlyProbe || ((FrameworkElement)sender).Tag is not SavedProfileRow row || !row.CanStart) return;
+        var profile = profiles.SingleOrDefault(profile => profile.Slot == row.Profile.Slot);
+        if (profile is not null) await StartProfile(profile);
+    }
+    private void EditSavedProfileClicked(object sender, RoutedEventArgs e)
+    {
+        if (busy || preview || readOnlyProbe || ((FrameworkElement)sender).Tag is not SavedProfileRow row || !row.CanEdit) return;
+        var profile = profiles.SingleOrDefault(profile => profile.Slot == row.Profile.Slot);
+        if (profile is not null) EditProfile(profile, desktop!.GetDisplays().Any(display => display.IsYomado && display.Slot == profile.Slot));
+    }
+    private bool ShowProfileDialog(ProfileDialog dialog)
+    {
+        var previousFocus = Keyboard.FocusedElement;
+        dialog.Owner = this; busy = true; model.IsBusy = true; timer.Stop();
+        try { return dialog.ShowDialog() == true; }
+        finally
         {
-            var item = new MenuItem { Header = profile.Name };
-            item.Items.Add(Menu("启动", async () => await StartProfile(profile)));
-            item.Items.Add(Menu("设置…", () => EditProfile(profile, false))); menu.Items.Add(item);
+            busy = false; model.IsBusy = false;
+            try { Refresh(); } catch (Exception ex) { model.Status = ex.Message; }
+            if (!exiting) timer.Start();
+            // A hidden or minimized owner must not steal focus when the dialog ends.
+            Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(() =>
+            {
+                if (IsVisible && WindowState != WindowState.Minimized && IsActive && previousFocus is UIElement { IsVisible: true, IsEnabled: true } element)
+                    element.Focus();
+            }));
         }
-        if (menu.Items.Count > 0) menu.Items.Add(new Separator());
-        menu.Items.Add(Menu("新建虚拟屏…", NewProfile)); OpenMenu(menu, (FrameworkElement)sender);
     }
     private async void NewProfile()
     {
-        if (busy) return;
+        if (busy || preview || readOnlyProbe) return;
         var slot = Enumerable.Range(0, DisplayProfile.MaximumDisplays).FirstOrDefault(i => profiles.All(p => p.Slot != i), -1);
         if (slot < 0) { model.Status = "最多保存 16 块虚拟屏。"; return; }
-        var dialog = new ProfileDialog(new((uint)slot, $"工作屏 {slot + 1}"), false, true) { Owner = this };
-        if (dialog.ShowDialog() != true) return;
-        try { store!.Save(profiles.Append(dialog.Result!)); profiles.Add(dialog.Result!); await StartProfile(dialog.Result!); }
+        var dialog = new ProfileDialog(new((uint)slot, $"工作屏 {slot + 1}"), false, true);
+        if (!ShowProfileDialog(dialog)) return;
+        try { store!.Save(profiles.Append(dialog.Result!)); profiles.Add(dialog.Result!); Refresh(); await StartProfile(dialog.Result!); }
         catch (Exception ex) { model.Status = ex.Message; }
     }
     private void EditProfile(DisplayProfile profile, bool active)
     {
-        if (busy) return;
-        var dialog = new ProfileDialog(profile, active, false) { Owner = this };
-        if (dialog.ShowDialog() != true) return;
+        if (busy || preview || readOnlyProbe) return;
+        var dialog = new ProfileDialog(profile, active, false);
+        if (!ShowProfileDialog(dialog)) return;
         try
         {
-            var updated = profiles.Select(p => p.Slot == profile.Slot ? dialog.Result! : p).ToArray();
-            store!.Save(updated); profiles.Clear(); profiles.AddRange(updated); Refresh();
+            var result = dialog.Result!;
+            if (desktop!.GetDisplays().Any(display => display.IsYomado && display.Slot == profile.Slot))
+                result = profile with { Name = result.Name };
+            var updated = profiles.Select(p => p.Slot == profile.Slot ? result : p).ToArray();
+            store!.Save(updated); profiles.Clear(); profiles.AddRange(updated); profileMessages.Remove(profile.Slot);
+            Refresh(); model.Status = "已保存屏幕配置。";
         }
         catch (Exception ex) { model.Status = ex.Message; }
     }
@@ -200,7 +266,7 @@ public partial class MainWindow : Window
         if (busy || preview || ((FrameworkElement)sender).Tag is not ScreenCard card || !card.Display.IsYomado) return;
         var profile = profiles.SingleOrDefault(p => p.Slot == card.Display.Slot);
         if (profile is null) { model.Status = "未找到此屏幕的配置，暂时无法管理。"; return; }
-        var menu = new ContextMenu(); menu.Items.Add(Menu("重命名与设置…", () => EditProfile(profile, true)));
+        var menu = new ContextMenu(); menu.Items.Add(Menu("重命名…", () => EditProfile(profile, true)));
         menu.Items.Add(new Separator()); menu.Items.Add(Menu("关闭虚拟屏", async () => await Operation(() => StopProfile(profile))));
         OpenMenu(menu, (FrameworkElement)sender);
     }
@@ -272,6 +338,7 @@ public partial class MainWindow : Window
     private void ShowTrayMenu()
     {
         var menu = new ContextMenu(); menu.Items.Add(Menu("打开控制面板", ShowPanel));
+        menu.Items.Add(Menu("添加或启动虚拟屏…", ShowPanel));
         foreach (var card in model.Screens.Where(card => card.Display.IsYomado))
         {
             var screen = new MenuItem { Header = card.Title };
@@ -338,7 +405,7 @@ public partial class MainWindow : Window
         foreach (var slot in driver!.GetConnectedSlots())
         {
             var profile = profiles.SingleOrDefault(p => p.Slot == slot) ?? throw new InvalidOperationException("此屏幕缺少配置，请先手动恢复窗口。");
-            await StopProfile(profile);
+            if (!await StopProfile(profile)) return;
         }
         exiting = true; timer.Stop(); tray?.Dispose(); desktop!.Dispose(); Desktop.KeepAwake(false); driver.Dispose(); Application.Current.Shutdown();
     });
@@ -394,6 +461,8 @@ public partial class MainWindow : Window
         model.Screens.Add(new(codex, "虚拟屏 1 · Codex", "1920 × 1080 · 100%", [new("", "QDoc", codex.Id, 1, null)]));
         model.Screens.Add(new(browser, "虚拟屏 2 · 工作屏", "2560 × 1440 · 100%", []));
         model.SetDriverHealth(new(DriverCondition.Ready, "虚拟显示驱动已就绪 · 示例显示数据"), true);
+        var saved = new SavedProfileRow(new(2, "Blender", 2560, 1440, true));
+        saved.Update(saved.Profile, true, true, false, ""); model.SavedProfiles.Add(saved);
         model.Status = "拖动应用图标移入虚拟屏，完成后返回原位置。";
     }
 }

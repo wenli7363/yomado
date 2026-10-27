@@ -10,6 +10,9 @@ namespace Yomado.App;
 public sealed class PanelModel : INotifyPropertyChanged
 {
     public ObservableCollection<ScreenCard> Screens { get; } = [];
+    public ObservableCollection<SavedProfileRow> SavedProfiles { get; } = [];
+    public bool HasSavedProfiles => SavedProfiles.Count != 0;
+    public PanelModel() => SavedProfiles.CollectionChanged += (_, _) => Changed(nameof(HasSavedProfiles));
     private string status = "拖动应用图标，将窗口移入虚拟屏。";
     private string driverStatus = "正在读取屏幕…";
     public string Status { get => status; set { status = value; Changed(); } }
@@ -57,3 +60,23 @@ public sealed record ScreenCard(DisplayInfo Display, string Title, string Detail
     public Brush FrameBrush => Display.IsYomado ? System.Windows.SystemColors.HighlightBrush : System.Windows.SystemColors.ControlDarkBrush;
 }
 public sealed record ApplicationDrag(string ApplicationPath, string SourceDisplayId);
+
+public sealed class SavedProfileRow : INotifyPropertyChanged
+{
+    public DisplayProfile Profile { get; private set; }
+    public string Name => Profile.DisplayName;
+    public string Detail => $"{Profile.Width} × {Profile.Height}{(Profile.HiDpi ? " · HiDPI · 2 倍像素" : "")}";
+    public string Message { get; private set; } = "";
+    public bool CanStart { get; private set; }
+    public bool CanEdit { get; private set; }
+    public string StartText { get; private set; } = "启动";
+    public SavedProfileRow(DisplayProfile profile) => Profile = profile;
+    public void Update(DisplayProfile profile, bool canStart, bool canEdit, bool starting, string message)
+    {
+        var startText = starting ? "启动中…" : "启动";
+        if (Profile == profile && CanStart == canStart && CanEdit == canEdit && StartText == startText && Message == message) return;
+        Profile = profile; CanStart = canStart; CanEdit = canEdit; StartText = startText; Message = message;
+        PropertyChanged?.Invoke(this, new(null));
+    }
+    public event PropertyChangedEventHandler? PropertyChanged;
+}

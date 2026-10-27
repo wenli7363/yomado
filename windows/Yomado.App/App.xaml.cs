@@ -14,10 +14,13 @@ namespace Yomado.App;
 public partial class App : Application
 {
     private Mutex? instance;
-    protected override void OnStartup(StartupEventArgs e)
+    private InputLeaseService? inputLease;
+    protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
         Palette.Apply();
+        if (InputLeaseCommand.IsCommand(e.Args)) { Shutdown(await InputLeaseCommand.RunAsync(e.Args)); return; }
+        if (e.Args.Length == 2 && e.Args[0] == "--test-input-lease") { InputLeaseSmoke.Run(e.Args[1]); return; }
         if (e.Args.Length is 1 or 2 && e.Args[0] == "--install-driver" && (e.Args.Length == 1 || e.Args[1] == "--trust-local-development"))
         { RunDriverInstaller(e.Args.Length == 2); return; }
         if (e.Args.Length == 2 && e.Args[0] == "--test-driver-setup") { DriverSetupSmoke.Run(e.Args[1]); return; }
@@ -29,7 +32,7 @@ public partial class App : Application
             var panel = new MainWindow(readOnlyProbe: true) { Opacity = 0, ShowActivated = false, ShowInTaskbar = false,
                 WindowStartupLocation = WindowStartupLocation.Manual, Left = -20000, Top = -20000 };
             panel.Show();
-            Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() => { panel.WritePanelProbe(e.Args[1]); Shutdown(); }));
+            _ = Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() => { panel.WritePanelProbe(e.Args[1]); Shutdown(); }));
             return;
         }
         if (e.Args.Length >= 2 && e.Args[0] == "--preview-ui")
@@ -40,10 +43,10 @@ public partial class App : Application
 #pragma warning restore WPF0001
             Palette.Apply(e.Args.Contains("dark"));
             var useDesktop = e.Args.Contains("--desktop");
-            var preview = new MainWindow(preview: !useDesktop, readOnlyProbe: useDesktop) { Width = 1180, Height = 570, ShowInTaskbar = false, ShowActivated = false,
+            var preview = new MainWindow(preview: !useDesktop, readOnlyProbe: useDesktop) { Width = 1180, Height = 650, ShowInTaskbar = false, ShowActivated = false,
                 WindowStyle = WindowStyle.None, Left = -20000, Top = -20000 };
             preview.Show();
-            Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
+            _ = Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
             {
                 preview.UpdateLayout();
                 var scale = e.Args.Contains("--225-percent") ? 2.25 : 1;
@@ -86,10 +89,14 @@ public partial class App : Application
             MessageBox.Show(error.Exception.Message, "yomado", MessageBoxButton.OK, MessageBoxImage.Warning);
             error.Handled = true;
         };
-        try { MainWindow = new MainWindow(); MainWindow.Show(); }
+        try
+        {
+            MainWindow = new MainWindow(); MainWindow.Show();
+            inputLease = new InputLeaseService(Dispatcher); inputLease.Start();
+        }
         catch (Exception ex) { MessageBox.Show(ex.Message, "无法启动 yomado", MessageBoxButton.OK, MessageBoxImage.Error); Shutdown(1); }
     }
-    protected override void OnExit(ExitEventArgs e) { instance?.Dispose(); base.OnExit(e); }
+    protected override void OnExit(ExitEventArgs e) { inputLease?.Dispose(); instance?.Dispose(); base.OnExit(e); }
     private async void RunDriverInstaller(bool approveDevelopmentTrust)
     { Shutdown((int)await DriverInstaller.RunElevatedAsync(AppContext.BaseDirectory, approveDevelopmentTrust)); }
     public static void OpenLink(string target) => Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });

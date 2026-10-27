@@ -15,6 +15,7 @@ public sealed class Workspace(IDesktop desktop)
     public void MoveApplication(string path, string? sourceId, string targetId)
     {
         var displays = desktop.GetDisplays();
+        DisplayTopology.RequireExtended(displays);
         var target = displays.SingleOrDefault(d => d.Id == targetId && d.IsYomado)
             ?? throw new InvalidOperationException("目标虚拟屏不可用，请刷新后重试。");
         var windows = desktop.GetWindows().Where(w => string.Equals(w.ApplicationPath, path, StringComparison.OrdinalIgnoreCase) &&
@@ -88,6 +89,27 @@ public sealed class Workspace(IDesktop desktop)
             throw new InvalidOperationException("屏幕中仍有待恢复窗口，尚未关闭虚拟屏。");
     }
 
+    public CloseSnapshot InspectClose(string displayId)
+    {
+        var displays = desktop.GetDisplays();
+        var display = displays.SingleOrDefault(item => item.Id == displayId && item.IsYomado)
+            ?? throw new InvalidOperationException("来源虚拟屏已变化，请刷新后重试。");
+        if (desktop.GetWindows().Any(window => GeometryPolicy.Owner(window.Frame, displays)?.Id == displayId) ||
+            origins.Values.Any(origin => origin.LastDisplayId == displayId))
+            throw new InvalidOperationException("屏幕中仍有待恢复窗口，尚未关闭虚拟屏。");
+        var snapshot = ClosePolicy.Capture(display, displays, desktop.GetUnmovableWindows(), origins.Values);
+        if (!desktop.GetDisplays().SequenceEqual(displays))
+            throw new InvalidOperationException("显示排列正在变化，已保留虚拟屏，请刷新后重试。");
+        return snapshot;
+    }
+
+    public void VerifyClose(CloseSnapshot offered, bool confirmed)
+    {
+        var current = InspectClose(offered.Display.Id);
+        if (!ClosePolicy.CanRemove(offered, current, confirmed))
+            throw new InvalidOperationException("待关闭屏幕的窗口已变化或尚未确认，已保留虚拟屏，请重新关闭并确认。");
+    }
+
     public void RefreshOrigins()
     {
         var displays = desktop.GetDisplays();
@@ -103,9 +125,12 @@ public sealed class Workspace(IDesktop desktop)
     private bool PlaceAndVerify(WindowInfo window, PixelRect frame, DisplayInfo target, bool maximize)
     {
         var liveTarget = desktop.GetDisplays().SingleOrDefault(d => d.Id == target.Id);
-        if (liveTarget is null || !liveTarget.Bounds.Near(target.Bounds) || !desktop.Place(window, frame, maximize)) return false;
+        if (liveTarget is null || !DisplayTopology.SameDisplay(target, liveTarget) || !desktop.Place(window, frame, maximize)) return false;
         var actual = desktop.GetWindow(window.Handle);
-        return SameIdentity(actual, window) && GeometryPolicy.Owner(actual!.Frame, desktop.GetDisplays())?.Id == target.Id &&
+        var displays = desktop.GetDisplays();
+        var confirmedTarget = displays.SingleOrDefault(d => d.Id == target.Id);
+        return confirmedTarget is not null && DisplayTopology.SameDisplay(target, confirmedTarget) &&
+            SameIdentity(actual, window) && GeometryPolicy.Owner(actual!.Frame, displays)?.Id == target.Id &&
             GeometryPolicy.PlacementVerified(actual, frame, target, maximize);
     }
 

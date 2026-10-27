@@ -35,6 +35,10 @@ internal static class Native
         [FieldOffset(0)] public uint Type; [FieldOffset(4)] public uint Id; [FieldOffset(8)] public Luid Adapter;
         [FieldOffset(16)] public uint Width; [FieldOffset(20)] public uint Height;
         [FieldOffset(24)] public uint PixelFormat; [FieldOffset(28)] public Point Position;
+        // Cover the complete native union, including target video timing.
+        [FieldOffset(16)] public ulong Raw0; [FieldOffset(24)] public ulong Raw1;
+        [FieldOffset(32)] public ulong Raw2; [FieldOffset(40)] public ulong Raw3;
+        [FieldOffset(48)] public ulong Raw4; [FieldOffset(56)] public ulong Raw5;
     }
     [StructLayout(LayoutKind.Sequential)] internal struct DeviceHeader { public uint Type, Size; public Luid Adapter; public uint Id; }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] internal struct SourceName
@@ -70,6 +74,7 @@ internal static class Native
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool IsWindowVisible(nint window);
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool IsIconic(nint window);
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool IsZoomed(nint window);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetClassName(nint window, System.Text.StringBuilder name, int capacity);
     [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(nint window, out uint pid);
     [DllImport("user32.dll")] internal static extern nint GetWindow(nint window, uint command);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] internal static extern nint GetWindowLongPtr(nint window, int index);

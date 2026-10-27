@@ -62,7 +62,7 @@ public sealed class Desktop : IDesktop, IDisposable
     private static IReadOnlyList<DisplayInfo>? DisplaySnapshot()
     {
         var config = DisplayConfiguration();
-        var targets = new Dictionary<string, Native.TargetName>(StringComparer.OrdinalIgnoreCase);
+        var targets = new Dictionary<string, List<(Native.TargetName Target, Native.TargetInfo Info, string Mode)>>(StringComparer.OrdinalIgnoreCase);
         foreach (var path in config.Paths)
         {
             var source = SourceName(path.Source);
@@ -70,7 +70,10 @@ public sealed class Desktop : IDesktop, IDisposable
             var error = Native.GetTargetName(ref target);
             if (error != 0) throw new Win32Exception(error);
             if (string.IsNullOrWhiteSpace(target.Path)) return null;
-            targets[source.Name] = target;
+            if (!targets.TryGetValue(source.Name, out var entries)) targets[source.Name] = entries = [];
+            var mode = $"{ModeSignature(config.Modes, path.Source.ModeIndex)}/{ModeSignature(config.Modes, path.Target.ModeIndex)}/" +
+                $"{path.Flags:X}:{path.Source.Flags:X}:{path.Target.Flags:X}:{path.Target.Scanline:X}:{path.Target.Technology:X}";
+            entries.Add((target, path.Target, mode));
         }
         var displays = new List<DisplayInfo>();
         var inconsistent = false;
@@ -81,7 +84,8 @@ public sealed class Desktop : IDesktop, IDisposable
             // EnumDisplayMonitors and QueryDisplayConfig can briefly disagree
             // during arrival/departure. An unmatched monitor must never become
             // an invented physical screen in the recovery inventory.
-            if (!targets.TryGetValue(info.Device, out var target)) { inconsistent = true; return true; }
+            if (!targets.TryGetValue(info.Device, out var entries)) { inconsistent = true; return true; }
+            var (target, targetInfo, _) = entries[0];
             var ours = (target.Path ?? "").Contains("DISPLAY#YMD594D#", StringComparison.OrdinalIgnoreCase);
             uint? slot = ours && target.Connector < DisplayProfile.MaximumDisplays ? target.Connector : null;
             if (ours && (target.Name ?? "").Trim().StartsWith("Yomado ", StringComparison.OrdinalIgnoreCase) &&
@@ -90,7 +94,12 @@ public sealed class Desktop : IDesktop, IDisposable
                 Native.GetDpiForMonitor(handle, 0, out var dpi, out _) == 0 ? dpi / 96d : 1;
             displays.Add(new(target.Path!, info.Device,
                 string.IsNullOrWhiteSpace(target.Name) ? info.Device : target.Name, info.Monitor.ToPixels(), info.Work.ToPixels(),
-                (info.Flags & 1) != 0, ours, slot, scale, target.Technology == 17));
+                (info.Flags & 1) != 0, ours, slot, scale, target.Technology == 17)
+            {
+                IsMirrored = entries.Count > 1, Rotation = targetInfo.Rotation, OutputScaling = targetInfo.Scaling,
+                RefreshNumerator = targetInfo.Refresh.Numerator, RefreshDenominator = targetInfo.Refresh.Denominator,
+                ModeSignature = string.Join("|", entries.OrderBy(entry => entry.Target.Path, StringComparer.OrdinalIgnoreCase).Select(entry => entry.Mode))
+            });
             return true;
         };
         if (!Native.EnumDisplayMonitors(0, 0, enumeration, 0)) throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -99,15 +108,21 @@ public sealed class Desktop : IDesktop, IDisposable
         return displays.OrderBy(d => d.Bounds.X).ThenBy(d => d.Bounds.Y).ToArray();
     }
 
+    private static string ModeSignature(Native.ModeInfo[] modes, uint index)
+    {
+        if (index >= modes.Length) return "unavailable";
+        var mode = modes[index];
+        return $"{mode.Type:X}:{mode.Id:X}:{mode.Adapter.High:X}:{mode.Adapter.Low:X}:" +
+            $"{mode.Raw0:X16}:{mode.Raw1:X16}:{mode.Raw2:X16}:{mode.Raw3:X16}:{mode.Raw4:X16}:{mode.Raw5:X16}";
+    }
+
     public IReadOnlyList<WindowInfo> GetWindows()
     {
         using var dpiContext = new DpiScope();
         var windows = new List<WindowInfo>();
         Native.WindowCallback enumeration = (handle, _) =>
         {
-            if (!Native.IsWindowVisible(handle) || Native.IsIconic(handle) || Native.GetWindow(handle, 4) != 0 ||
-                ((long)Native.GetWindowLongPtr(handle, -20) & 0x80) != 0) return true;
-            if (Native.DwmGetWindowAttribute(handle, 14, out var cloaked, 4) == 0 && cloaked != 0) return true;
+            if (!VisibleApplicationWindow(handle) || IsNonOrdinary(handle) || Native.IsIconic(handle)) return true;
             var window = GetWindow(handle);
             if (window is not null && window.Frame.Width >= 80 && window.Frame.Height >= 64) windows.Add(window);
             return true;
@@ -115,6 +130,56 @@ public sealed class Desktop : IDesktop, IDisposable
         if (!Native.EnumWindows(enumeration, 0)) throw new Win32Exception(Marshal.GetLastWin32Error());
         return windows;
     }
+
+    public IReadOnlyList<WindowInfo> GetUnmovableWindows()
+    {
+        using var dpiContext = new DpiScope();
+        var windows = new List<WindowInfo>();
+        var incomplete = false;
+        Native.WindowCallback enumeration = (handle, _) =>
+        {
+            if (!VisibleApplicationWindow(handle)) return true;
+            var window = GetWindow(handle);
+            if (window is null)
+            {
+                // Distinguish a window that closed from one whose identity we
+                // could not read. Keep the latter's geometry so only its own
+                // display is blocked; it must never become an empty inventory.
+                if (!Native.IsWindow(handle) || !VisibleApplicationWindow(handle)) return true;
+                if (Native.GetWindowThreadProcessId(handle, out var pid) == 0 || pid == 0 || pid == Environment.ProcessId) return true;
+                if (!Native.GetWindowRect(handle, out var frame)) { incomplete = true; return true; }
+                windows.Add(new(handle, (int)pid, 0, $"unknown-process:{pid}", "无法核对的应用", frame.ToPixels(), false)
+                { IsDialog = true, Generation = generations.GetOrAdd(handle, _ => Interlocked.Increment(ref generation)) });
+                return true;
+            }
+            if (IsNonOrdinary(handle) || window.Minimized || window.Frame.Width < 80 || window.Frame.Height < 64)
+                windows.Add(window);
+            return true;
+        };
+        if (!Native.EnumWindows(enumeration, 0)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        if (incomplete) throw new InvalidOperationException("有窗口的位置尚未核对完成，已保留虚拟屏，请稍后重试。");
+        return windows;
+    }
+
+    private static string WindowClass(nint handle)
+    {
+        var name = new System.Text.StringBuilder(256);
+        Native.GetClassName(handle, name, name.Capacity);
+        return name.ToString();
+    }
+
+    private static bool VisibleApplicationWindow(nint handle)
+    {
+        if (!Native.IsWindowVisible(handle)) return false;
+        if (Native.DwmGetWindowAttribute(handle, 14, out var cloaked, 4) == 0 && cloaked != 0) return false;
+        // Desktop/taskbar and transient menu, tooltip, shadow and input-method
+        // surfaces are not application windows to restore.
+        return WindowClass(handle) is not ("Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd" or
+            "tooltips_class32" or "SysShadow" or "#32768" or "IME" or "MSCTFIME UI");
+    }
+
+    private static bool IsNonOrdinary(nint handle) => Native.GetWindow(handle, 4) != 0 ||
+        ((long)Native.GetWindowLongPtr(handle, -20) & 0x80) != 0 || WindowClass(handle) == "#32770";
 
     public WindowInfo? GetWindow(nint handle)
     {
@@ -144,7 +209,8 @@ public sealed class Desktop : IDesktop, IDisposable
                 normal = normal with { X = normal.X + monitor.Work.Left - monitor.Monitor.Left, Y = normal.Y + monitor.Work.Top - monitor.Monitor.Top };
         }
         return new(handle, (int)pid, start, path, name, Native.IsIconic(handle) ? normal : rect.ToPixels(), Native.IsZoomed(handle))
-        { NormalFrame = normal, Minimized = Native.IsIconic(handle), Generation = generations.GetOrAdd(handle, _ => Interlocked.Increment(ref generation)) };
+        { NormalFrame = normal, Minimized = Native.IsIconic(handle), IsDialog = IsNonOrdinary(handle),
+            Generation = generations.GetOrAdd(handle, _ => Interlocked.Increment(ref generation)) };
     }
 
     public bool Place(WindowInfo identity, PixelRect frame, bool maximize)

@@ -21,6 +21,12 @@ public sealed record DisplayInfo(string Id, string DeviceName, string Name, Pixe
     PixelRect WorkArea, bool IsPrimary, bool IsYomado, uint? Slot = null, double Scale = 1, bool IsExternalVirtual = false)
 {
     public bool IsVirtual => IsYomado || IsExternalVirtual;
+    public bool IsMirrored { get; init; }
+    public uint Rotation { get; init; }
+    public uint OutputScaling { get; init; }
+    public uint RefreshNumerator { get; init; }
+    public uint RefreshDenominator { get; init; }
+    public string ModeSignature { get; init; } = "";
 }
 
 public sealed record DisplayProfile(uint Slot, string Name, int Width = 1920, int Height = 1080, bool HiDpi = false)
@@ -29,6 +35,7 @@ public sealed record DisplayProfile(uint Slot, string Name, int Width = 1920, in
     public int PixelWidth => checked(Width * (HiDpi ? 2 : 1));
     public int PixelHeight => checked(Height * (HiDpi ? 2 : 1));
     public bool IsValid => Slot < MaximumDisplays && !string.IsNullOrWhiteSpace(Name) && Name.Trim().Length <= 60 &&
+        !Name.Any(char.IsControl) &&
         ((Width == 1920 && Height == 1080) || (Width == 2560 && Height == 1440));
     public string DisplayName => $"虚拟屏 {Slot + 1} · {Name}";
 }
@@ -40,6 +47,7 @@ public sealed record WindowInfo(nint Handle, int ProcessId, long ProcessStart, s
     public PixelRect NormalFrame { get; init; } = Frame;
     public long Generation { get; init; }
     public bool Minimized { get; init; }
+    public bool IsDialog { get; init; }
 }
 public sealed record WindowOrigin(WindowInfo Window, string? PhysicalDisplayId, PixelRect OriginalFrame,
     PixelRect? RelativeFrame, bool WasMaximized, string LastDisplayId, double OriginalScale = 1);
@@ -48,6 +56,7 @@ public interface IDesktop
 {
     IReadOnlyList<DisplayInfo> GetDisplays();
     IReadOnlyList<WindowInfo> GetWindows();
+    IReadOnlyList<WindowInfo> GetUnmovableWindows() => [];
     WindowInfo? GetWindow(nint handle);
     bool Place(WindowInfo identity, PixelRect frame, bool maximize);
 }

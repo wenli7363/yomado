@@ -152,6 +152,9 @@ Test("null profile entries are safely ignored", () =>
     var file = Path.Combine(Path.GetTempPath(), $"yomado-test-{Guid.NewGuid()}.json"); File.WriteAllText(file,"[null]");
     try { Check(new ProfileStore(file).Load().Count == 0); } finally { File.Delete(file); }
 });
+DisplayTopologyTests.Register(Test);
+ClosePolicyTests.Register(Test);
+InputLeaseTests.Register(Test);
 foreach (var (name, run) in tests)
 {
     try { run(); Console.WriteLine($"PASS {name}"); }
