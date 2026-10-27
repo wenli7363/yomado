@@ -57,6 +57,26 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
     return label;
 }
 
+static NSColor *YMWorkspaceSRGB(unsigned int value) {
+    return [NSColor colorWithSRGBRed:((value>>16)&255)/255.0
+        green:((value>>8)&255)/255.0 blue:(value&255)/255.0 alpha:1];
+}
+
+static void YMWorkspaceScreenPalette(BOOL dark, BOOL physical, BOOL highlighted,
+    NSColor **start, NSColor **end, NSColor **border, NSColor **detail) {
+    *start = YMWorkspaceSRGB(dark ? (physical ? 0x36383D : 0x263C55)
+                                  : (physical ? 0xF0F1F3 : 0xEAF2FF));
+    *end = YMWorkspaceSRGB(dark ? (physical ? 0x2E3035 : 0x1E3149)
+                                : (physical ? 0xE3E6EB : 0xD7E7FC));
+    *border = YMWorkspaceSRGB(dark ? (physical ? 0x77818F : 0x657E9E)
+                                   : (physical ? 0x858E9B : 0x7088A8));
+    *detail = [NSColor.labelColor colorWithAlphaComponent:dark ? 0.65 : 0.60];
+    if (highlighted) {
+        *start = [*start blendedColorWithFraction:0.08 ofColor:NSColor.controlAccentColor];
+        *end = [*end blendedColorWithFraction:0.12 ofColor:NSColor.controlAccentColor];
+        *border = [NSColor.controlAccentColor colorWithAlphaComponent:0.90];
+    }
+}
 
 @interface YMWorkspaceScreenView : NSView
 @property(nonatomic) BOOL physical;
@@ -74,19 +94,21 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
     (void)dirtyRect;
     NSRect rect=NSInsetRect(self.bounds,0.75,0.75);
     CGFloat width=rect.size.width;
-    NSColor *accent=self.highlighted ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
+    BOOL dark = [[self.effectiveAppearance bestMatchFromAppearancesWithNames:
+        @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]] isEqualToString:NSAppearanceNameDarkAqua];
+    NSColor *top, *bottom, *borderColor, *detailColor;
+    YMWorkspaceScreenPalette(dark, self.physical, self.highlighted,
+        &top, &bottom, &borderColor, &detailColor);
     NSBezierPath *shape=[NSBezierPath bezierPathWithRoundedRect:rect xRadius:7 yRadius:7];
-    NSColor *top=[NSColor.controlBackgroundColor blendedColorWithFraction:self.highlighted ? 0.13 : 0.045 ofColor:NSColor.systemBlueColor];
-    NSColor *bottom=[NSColor.controlBackgroundColor blendedColorWithFraction:self.highlighted ? 0.20 : 0.10 ofColor:NSColor.systemBlueColor];
     [[[NSGradient alloc] initWithStartingColor:top endingColor:bottom] drawInBezierPath:shape angle:90];
-    [[accent colorWithAlphaComponent:self.highlighted ? 0.9 : 0.38] setStroke];
+    [borderColor setStroke];
     shape.lineWidth=self.highlighted ? 1.5 : 1;
     [shape stroke];
     NSMutableParagraphStyle *nameStyle=[NSMutableParagraphStyle new]; nameStyle.alignment=NSTextAlignmentCenter; nameStyle.lineBreakMode=NSLineBreakByTruncatingTail;
     [self.name drawInRect:NSMakeRect(NSMinX(rect)+9,7,width-18,15) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:10 weight:NSFontWeightMedium],NSForegroundColorAttributeName:NSColor.labelColor,NSParagraphStyleAttributeName:nameStyle}];
     if (self.detail.length) {
         NSMutableParagraphStyle *style=[NSMutableParagraphStyle new]; style.alignment=NSTextAlignmentCenter; style.lineBreakMode=NSLineBreakByTruncatingTail;
-        [self.detail drawInRect:NSMakeRect(NSMinX(rect)+8,22,width-16,13) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:8.5], NSForegroundColorAttributeName:NSColor.secondaryLabelColor,NSParagraphStyleAttributeName:style}];
+        [self.detail drawInRect:NSMakeRect(NSMinX(rect)+8,22,width-16,13) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:8.5], NSForegroundColorAttributeName:detailColor,NSParagraphStyleAttributeName:style}];
     }
 }
 @end
@@ -278,7 +300,7 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
 - (instancetype)initWithFrame:(NSRect)frame {
     self=[super initWithFrame:frame];
     if (self) {
-        _displayName=@"虚拟屏"; _displayAspectRatio=16.0/9.0; _displayDetail=@""; _statusText=@""; _contextNote=@""; _rows=@[]; _rowSignature=@[];
+        _displayName=@"虚拟屏"; _displayAspectRatio=16.0/9.0; _displayDetail=@""; _statusText=@""; _contextNote=@""; _rows=@[]; _rowSignature=@[]; _acceptsApplications=YES;
         self.translatesAutoresizingMaskIntoConstraints=NO;
         [self registerForDraggedTypes:@[YMWorkspaceApplicationType,NSPasteboardTypeFileURL]];
         _screenView=[[YMWorkspaceScreenView alloc] initWithFrame:NSZeroRect]; _screenView.translatesAutoresizingMaskIntoConstraints=NO;
@@ -326,6 +348,7 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
 - (BOOL)isPhysicalWorkspace { return self.physicalDisplay || self.displayID==0; }
 - (void)setDisplayID:(uint32_t)value { if (_displayID==value) return; _displayID=value; [self updatePresentation]; [self rebuildIcons]; }
 - (void)setPhysicalDisplay:(BOOL)value { if (_physicalDisplay==value) return; _physicalDisplay=value; [self updatePresentation]; [self rebuildIcons]; }
+- (void)setAcceptsApplications:(BOOL)value { _acceptsApplications=value; if (!value) self.highlighted=NO; [self updatePresentation]; }
 - (void)setDisplayAspectRatio:(CGFloat)value {
     if (!isfinite(value) || value<0.25 || value>8 || fabs(_displayAspectRatio-value)<0.0001) return;
     _displayAspectRatio=value; self.screenAspectConstraint.active=NO;
@@ -364,7 +387,7 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
 - (void)layout { [super layout]; [self.desktopScroll resizeIconDocument]; }
 - (void)drawRect:(NSRect)dirtyRect { (void)dirtyRect; if (!self.highlighted) return; [[NSColor.controlAccentColor colorWithAlphaComponent:0.05] setFill]; [[NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds,0.5,0.5) xRadius:10 yRadius:10] fill]; }
 - (void)choose:(id)sender {
-    (void)sender; if (!(self.available && self.trusted && self.onChooseApplication)) return;
+    (void)sender; if (!(self.available && self.trusted && self.acceptsApplications && self.onChooseApplication)) return;
     YMWorkspaceBeginInteraction(); @try { self.onChooseApplication(); } @finally { YMWorkspaceEndInteraction(); }
 }
 - (void)manage:(id)sender {
@@ -376,7 +399,7 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
 - (NSMenu *)menuForEvent:(NSEvent *)event {
     (void)event; if (self.isPhysicalWorkspace) return nil;
     NSMenu *menu=[[NSMenu alloc] initWithTitle:self.displayName]; menu.autoenablesItems=NO; menu.delegate=self;
-    NSMenuItem *add=[[NSMenuItem alloc] initWithTitle:@"添加应用…" action:@selector(choose:) keyEquivalent:@""]; add.target=self; add.enabled=self.available && self.trusted && self.onChooseApplication!=nil; [menu addItem:add];
+    NSMenuItem *add=[[NSMenuItem alloc] initWithTitle:@"添加应用…" action:@selector(choose:) keyEquivalent:@""]; add.target=self; add.enabled=self.available && self.trusted && self.acceptsApplications && self.onChooseApplication!=nil; [menu addItem:add];
     if (self.onManageDisplay) { NSMenuItem *manage=[[NSMenuItem alloc] initWithTitle:@"管理这个屏幕…" action:@selector(manage:) keyEquivalent:@""]; manage.target=self; [menu addItem:manage]; }
     return menu;
 }
@@ -387,10 +410,10 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
     self.desktopBottomConstraint.constant=physical ? -6 : -28;
     self.screenView.physical=physical; self.screenView.detail=self.displayDetail.length ? self.displayDetail : (physical ? @"实体屏" : @"虚拟屏");
     [self.screenView setAccessibilityLabel:[NSString stringWithFormat:@"%@，%@",self.titleLabel.stringValue,self.screenView.detail]];
-    self.chooseButton.hidden=physical; self.chooseButton.enabled=self.available && self.trusted;
+    self.chooseButton.hidden=physical; self.chooseButton.enabled=self.available && self.trusted && self.acceptsApplications;
     self.chooseButton.toolTip=[NSString stringWithFormat:@"向 %@ 添加应用",self.titleLabel.stringValue]; [self.chooseButton setAccessibilityLabel:self.chooseButton.toolTip];
     self.manageButton.hidden=physical || !self.onManageDisplay; self.manageButton.toolTip=[NSString stringWithFormat:@"管理 %@",self.titleLabel.stringValue]; [self.manageButton setAccessibilityLabel:self.manageButton.toolTip];
-    self.emptyLabel.stringValue=!self.available ? @"屏幕未就绪" : physical ? @"暂无应用窗口" : @"拖入应用";
+    self.emptyLabel.stringValue=(!self.available || !self.acceptsApplications) ? @"屏幕未就绪" : physical ? @"暂无应用窗口" : @"拖入应用";
     self.toolTip=self.trusted ? @"将应用图标拖到另一个屏幕；也可以从 Finder 拖入已打开的 App。" : @"允许窗口控制后，即可拖放应用。";
     self.statusLabel.stringValue=self.statusText;
     BOOL generic=[self.statusText hasSuffix:@" 个应用 · 可见窗口"] || [self.statusText isEqualToString:@"从上方工作屏拖回，或选择要移回的应用。"] || [self.statusText isEqualToString:@"辅助功能授权后可移动应用窗口"];
@@ -457,7 +480,7 @@ static NSTextField *YMWorkspaceLabel(NSString *text, CGFloat size, NSFontWeight 
     self.grid.icons=icons; self.emptyLabel.hidden=YES; [self updateDragFeedback];
 }
 - (NSDictionary *)payloadForDraggingInfo:(id<NSDraggingInfo>)sender {
-    if (!(self.available && self.trusted)) return nil;
+    if (!(self.available && self.trusted && self.acceptsApplications)) return nil;
     NSPasteboard *pasteboard = sender.draggingPasteboard;
     NSData *data = [pasteboard dataForType:YMWorkspaceApplicationType];
     if (data.length && data.length < 16384) {

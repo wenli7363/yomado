@@ -4,16 +4,23 @@
 #import <Carbon/Carbon.h>
 #import <dlfcn.h>
 #import <signal.h>
+#import <os/log.h>
 #import "VDVirtualDisplay.h"
+#import "YMDisplayTopology.h"
 #import "LayoutPolicy.h"
 #import "DiagnosticPrivacy.h"
 #import "ControlUI.h"
 #import "WindowRecovery.h"
 #import "AppWorkspace.h"
+#import "AppWorkspacePolicy.h"
 #import "AppWorkspaceView.h"
-#import "UpdateChecker.h"
+#import "AutomaticUpdater.h"
+#import "UpdateWorkspaceRecovery.h"
 #import "MenuBarIcon.h"
 #import "PanelPresentation.h"
+#import "DisplayProfileEditor.h"
+#import "SavedDisplayProfilesView.h"
+#import "InputLease.h"
 
 static NSString *YMAppVersion(void) {
     return [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"—";
@@ -123,6 +130,9 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property NSUInteger height;
 @property BOOL hiDPI;
 @property VDVirtualDisplay *display;
+@property BOOL topologyVerified;
+@property BOOL starting;
+@property(copy) NSString *startFailureText;
 @end
 @implementation YMManagedDisplay
 @end
@@ -130,9 +140,18 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @interface ADController : NSObject <NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate>
 @property NSWindow *window;
 @property NSStatusItem *statusItem;
-@property YMUpdateChecker *updateChecker;
+@property YMAutomaticUpdater *automaticUpdater;
+@property YMUpdateWorkspaceRecovery *updateRecovery;
 @property NSButton *updateButton;
-@property NSAlert *updateAlert;
+@property NSButton *automaticUpdatesButton;
+@property NSButton *cancelUpdateButton;
+@property NSTextField *updateStatusLabel;
+@property NSProgressIndicator *updateProgress;
+@property NSStackView *updateStatusRow;
+@property BOOL updateWorkspaceBusy;
+@property BOOL updateRecoveryFailed;
+@property(copy) NSArray<NSDictionary *> *pendingUpdateProfiles;
+@property(copy) NSString *updateRecoveryMessage;
 @property NSTextField *statusLabel;
 @property NSTextField *inventoryLabel;
 @property NSTextField *detailLabel;
@@ -156,6 +175,7 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property YMManagedDisplay *selectedProfile;
 @property NSButton *addDisplayButton;
 @property YMAppWorkspace *appWorkspace;
+@property YMInputLeaseCenter *inputLeases;
 @property NSStackView *applicationCards;
 @property NSView *permissionContainer;
 @property NSMutableDictionary<NSNumber *, YMAppWorkspaceView *> *workspaceViews;
@@ -164,6 +184,11 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property CGDirectDisplayID wechatDisplayID;
 @property BOOL updatingInventory;
 @property BOOL displayOperationInProgress;
+@property(nonatomic) YMDisplayTopology *displayTopology;
+@property YMDisplayTopologySnapshot *topologyRecoverySnapshot;
+@property CGDirectDisplayID topologyRecoveryRemovedID;
+@property(nonatomic) dispatch_queue_t topologyQueue;
+@property BOOL terminationAfterTopologyRecovery;
 @property BOOL appOperationInProgress;
 @property NSArray<NSDictionary *> *originalLayout;
 @property CGDirectDisplayID originalMain;
@@ -182,9 +207,45 @@ static NSString *JSONText(id object) { return JSONTextWithIdentifiers(object, NO
 @property IOPMAssertionID displayAssertion;
 @property EventHotKeyRef hotkey;
 @property EventHandlerRef keyHandler;
+@property(strong) YMControlPanelPresenter *panelPresenter;
+@property YMDisplayProfileEditor *profileEditor;
+@property BOOL profileEditorCommitInProgress;
+@property(copy) NSNumber *pendingProfileRevealOrdinal;
+@property YMSavedDisplayProfilesView *savedProfilesView;
+@property NSTextField *profileActivityLabel;
+@property(weak) NSView *profileEditorOrigin;
+@property BOOL profileEditorFocusPending;
+@property(copy) NSString *profileStartRejectionText;
+// Test-only dependency seams. Nil keeps production NSUserDefaults / DisplaySnapshot.
+@property(nonatomic, strong) NSMutableDictionary *displayProfilesPreferenceStore;
+@property(nonatomic, copy) NSArray<NSDictionary *> *(^inventorySnapshotProvider)(void);
 - (void)restore:(id)sender;
 - (void)buildWindow;
+- (void)preparePanelPresenter;
 - (void)updateInventory;
+// Private test seam: production returns DisplaySnapshot(); tests override with fixtures.
+- (NSArray<NSDictionary *> *)controllerDisplaySnapshot;
+- (void)beginUpdater;
+- (void)automaticUpdateStateDidChange;
+- (void)restoreUpdateWorkspace;
+- (void)restoreUpdateProfileAtIndex:(NSUInteger)index;
+- (void)refreshUpdateUI;
+- (BOOL)profileActionsAvailableForEditor:(YMDisplayProfileEditor *)editor;
+- (BOOL)acceptProfileDraft:(YMDisplayProfileDraft *)draft
+                      mode:(YMDisplayProfileEditorMode)mode
+                   ordinal:(NSUInteger)ordinal
+                    editor:(YMDisplayProfileEditor *)editor
+                     error:(NSError **)error;
+- (BOOL)startSavedProfileWithOrdinal:(NSUInteger)ordinal error:(NSError **)error;
+- (NSArray<YMSavedDisplayProfileRow *> *)savedProfileRows;
+- (NSString *)profileActivityText;
+- (void)createSelectedProfilePersistingOnSuccess:(BOOL)persistOnSuccess;
+- (YMDisplayProfileEditor *)makeDisplayProfileEditorWithMode:(YMDisplayProfileEditorMode)mode
+                                                       draft:(YMDisplayProfileDraft *)draft;
+- (void)presentProfileEditorForOrdinal:(NSUInteger)ordinal mode:(YMDisplayProfileEditorMode)mode;
+- (void)updateSavedProfilesPresentation;
+- (void)restoreProfileEditorFocus;
+- (void)installPreviewProfilesForState:(NSString *)state;
 @end
 
 static OSStatus RecoveryHotkey(EventHandlerCallRef next, EventRef event, void *data) {
@@ -228,12 +289,169 @@ static NSView *YMSpacer(void) {
 }
 @end
 
+// Owned preview-only display. Never calls create/destroy private APIs.
+@interface YMPreviewFixtureDisplay : VDVirtualDisplay
+@property(nonatomic) BOOL live;
+@property(nonatomic) CGDirectDisplayID fixtureID;
+@end
+@implementation YMPreviewFixtureDisplay
+- (BOOL)isCreated { return self.live; }
+- (CGDirectDisplayID)displayID { return self.live ? self.fixtureID : 0; }
+- (BOOL)createWithWidth:(NSUInteger)width height:(NSUInteger)height hiDPI:(BOOL)hiDPI
+                   name:(NSString *)name error:(NSError **)error {
+    (void)width; (void)height; (void)hiDPI; (void)name; (void)error;
+    return NO;
+}
+- (void)destroy {}
+@end
+
 @implementation ADController
+- (YMDisplayTopology *)displayTopology {
+    if (!_displayTopology) _displayTopology = [[YMDisplayTopology alloc] init];
+    return _displayTopology;
+}
+- (BOOL)canMoveIntoProfile:(YMManagedDisplay *)profile {
+    return profile && profile.topologyVerified && !self.updateWorkspaceBusy && !self.displayOperationInProgress && !self.topologyRecoverySnapshot && profile.display.isCreated &&
+        [self.displayTopology isExtendedTarget:profile.display.displayID width:profile.width height:profile.height hiDPI:profile.hiDPI];
+}
+- (void)reportTopologyError:(NSError *)error {
+    self.statusLabel.stringValue = @"显示配置未通过检查";
+    self.detailLabel.stringValue = error.localizedDescription ?: @"未能确认原有屏幕配置保持不变；已停止移入应用。";
+    if (!self.previewMode && self.window && !self.window.attachedSheet) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"工作屏未就绪";
+        alert.informativeText = self.detailLabel.stringValue;
+        [alert addButtonWithTitle:@"好"];
+        [self showWindow:nil];
+        [alert beginSheetModalForWindow:self.window completionHandler:nil];
+    }
+}
+// CoreGraphics may not publish a new screen's mode to this process until
+// AppKit handles its display-change event. Keep the normal main event loop free
+// instead of recursively dispatching user input inside a configuration wait.
+- (void)performTopologyOperation:(BOOL (^)(NSError **))operation completion:(void (^)(BOOL, NSError *))completion {
+    if (!self.topologyQueue) self.topologyQueue = dispatch_queue_create("dev.chekusu.yomado.topology", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(self.topologyQueue, ^{
+        @autoreleasepool {
+            NSError *error = nil;
+            BOOL result = operation(&error);
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(result, error); });
+        }
+    });
+}
+// Quit and close failures used to leave their reason only in status labels
+// that are not shown. Log each one so a refused quit can be traced with
+// `log show --predicate 'subsystem == "dev.chekusu.yomado"'`.
+static os_log_t YMQuitLog(void) {
+    static os_log_t quitLog;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ quitLog = os_log_create("dev.chekusu.yomado", "quit"); });
+    return quitLog;
+}
+- (void)logQuitStep:(NSString *)step {
+    os_log(YMQuitLog(), "%{public}@ | status: %{public}@ | detail: %{public}@", step,
+        self.statusLabel.stringValue ?: @"", self.detailLabel.stringValue ?: @"");
+}
+- (NSApplicationTerminateReply)refuseTermination:(NSString *)reason {
+    [self logQuitStep:[@"quit refused: " stringByAppendingString:reason]];
+    return NSTerminateCancel;
+}
+// Dialogs, splash screens and tool windows cannot be matched to a movable
+// window, so they cannot return to a remembered origin. Ask once before
+// leaving them for macOS to relocate when the screens are removed.
+- (BOOL)confirmUnmovableWindowsOnDisplayIDs:(NSArray<NSNumber *> *)displayIDs {
+    if (self.appOperationInProgress) return NO;
+    self.appOperationInProgress = YES;
+    @try {
+    __block NSMutableArray *items;
+    BOOL observed = WaitUntil(^BOOL{
+        [self updateInventory];
+        items = [NSMutableArray array];
+        for (NSNumber *ID in displayIDs) {
+            NSArray *windows = [self.appWorkspace unmovableWindowsForDisplayID:ID.unsignedIntValue];
+            if (!windows) return NO;
+            [items addObjectsFromArray:windows];
+        }
+        return YES;
+    }, 1.5);
+    if (!observed) {
+        [self.appWorkspace cancelUnmovableWindowAllowances];
+        [self reportApplicationError:nil fallback:@"窗口清单尚未核对完成，已保留虚拟屏。请稍后重试关闭。"];
+        return NO;
+    }
+    NSString *summary = YMWorkspaceUnmovableSummary(items);
+    if (!summary.length) return YES;
+    [self logQuitStep:[@"windows that cannot return: " stringByAppendingString:summary]];
+    if (![self confirmLeavingUnmovableWindows:summary]) {
+        [self.appWorkspace cancelUnmovableWindowAllowances];
+        [self logQuitStep:@"user kept the screens because of windows that cannot return"];
+        return NO;
+    }
+    for (NSNumber *ID in displayIDs) [self.appWorkspace allowUnmovableWindowsOnDisplayID:ID.unsignedIntValue];
+    return YES;
+    } @finally {
+        self.appOperationInProgress = NO;
+    }
+}
+- (BOOL)confirmLeavingUnmovableWindows:(NSString *)summary {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"有窗口无法挪回原位";
+    alert.informativeText = [NSString stringWithFormat:@"%@多半是弹窗、启动画面或工具窗，yomado 无法可靠地把它们挪回原位。其他窗口照常返回原位。\n继续关闭后，macOS 会把这些窗口移到剩下的屏幕上，位置可能不同。", summary];
+    [alert addButtonWithTitle:@"继续关闭"];
+    [alert addButtonWithTitle:@"取消"];
+    // The prompt can appear while the person is typing elsewhere. Return must
+    // not leave windows behind; only an explicit click on 继续关闭 does.
+    alert.buttons.firstObject.keyEquivalent = @"";
+    alert.buttons.lastObject.keyEquivalent = @"\r";
+    [self showWindow:nil];
+    return [alert runModal] == NSAlertFirstButtonReturn;
+}
+- (void)resumeTerminationAfterTopologyRecovery:(BOOL)recovered {
+    BOOL requested = self.terminationAfterTopologyRecovery;
+    self.terminationAfterTopologyRecovery = NO;
+    if (requested) [self logQuitStep:recovered ? @"quit continues after a screen was removed" : @"quit stopped: display recovery failed"];
+    if (requested && recovered) dispatch_async(dispatch_get_main_queue(), ^{ [NSApp terminate:nil]; });
+}
+- (void)recoverTopology:(YMDisplayTopologySnapshot *)snapshot removedID:(CGDirectDisplayID)removedID completion:(void (^)(BOOL, NSError *))completion {
+    self.topologyRecoverySnapshot = snapshot;
+    self.topologyRecoveryRemovedID = removedID;
+    YMDisplayTopology *topology = self.displayTopology;
+    [self performTopologyOperation:^BOOL(NSError **error) {
+        return [topology restoreAndVerifySnapshot:snapshot excludingDisplayID:removedID error:error];
+    } completion:^(BOOL restored, NSError *error) {
+        if (restored) {
+            self.topologyRecoverySnapshot = nil;
+            self.topologyRecoveryRemovedID = 0;
+            for (YMManagedDisplay *profile in self.displayProfiles) {
+                if ([profile.startFailureText isEqualToString:@"显示排列待恢复，请先使用恢复入口。"])
+                    profile.startFailureText = nil;
+            }
+        }
+        completion(restored, error);
+    }];
+}
+- (void)retryTopologyRecovery:(id)sender {
+    (void)sender;
+    if (!self.topologyRecoverySnapshot || self.displayOperationInProgress || self.appOperationInProgress) return;
+    self.displayOperationInProgress = YES;
+    [self recoverTopology:self.topologyRecoverySnapshot removedID:self.topologyRecoveryRemovedID completion:^(BOOL restored, NSError *error) {
+        self.displayOperationInProgress = NO;
+        if (!restored) [self reportTopologyError:error];
+        [self updateInventory];
+        [self resumeTerminationAfterTopologyRecovery:restored];
+    }];
+}
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     if (self.previewMode) return;
     (void)notification;
     [self loadDisplayProfiles];
     self.appWorkspace = [[YMAppWorkspace alloc] init];
+    __weak ADController *weakSelf = self;
+    self.appWorkspace.inventoryDidChange = ^{
+        ADController *controller = weakSelf;
+        if (!controller) return;
+        [controller updateInventory];
+    };
     self.windowRecovery = [[YMWindowRecovery alloc] initWithCheckpointURL:nil];
     self.targets = @[];
     self.systemAssertion = kIOPMNullAssertionID;
@@ -244,7 +462,7 @@ static NSView *YMSpacer(void) {
     NSMenu *main = [[NSMenu alloc] init];
     NSMenuItem *appItem = [[NSMenuItem alloc] initWithTitle:@"yomado" action:nil keyEquivalent:@""];
     NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"yomado"];
-    NSMenuItem *updateItem = [[NSMenuItem alloc] initWithTitle:@"检查更新…" action:@selector(checkForUpdates:) keyEquivalent:@""];
+    NSMenuItem *updateItem = [[NSMenuItem alloc] initWithTitle:@"检查并安装更新…" action:@selector(checkForUpdates:) keyEquivalent:@""];
     updateItem.target = self;
     [appMenu addItem:updateItem];
     [appMenu addItem:NSMenuItem.separatorItem];
@@ -255,6 +473,8 @@ static NSView *YMSpacer(void) {
     [main addItem:appItem];
     NSApp.mainMenu = main;
     [self buildWindow];
+    self.inputLeases = [[YMInputLeaseCenter alloc] init];
+    [self.inputLeases start];
     EventTypeSpec type = { kEventClassKeyboard, kEventHotKeyPressed };
     OSStatus handlerStatus = InstallEventHandler(GetApplicationEventTarget(), RecoveryHotkey, 1, &type,
                                                 (__bridge void *)self, &_keyHandler);
@@ -266,7 +486,7 @@ static NSView *YMSpacer(void) {
         self.detailLabel.stringValue = @"恢复快捷键注册失败；为保留恢复途径，实体屏关闭功能已停用。";
     }
     [self updateInventory];
-    [self showWindow:nil];
+    [self restoreUpdateWorkspace];
     self.heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(tick:)
                                                        userInfo:nil repeats:YES];
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(systemWillSleep:)
@@ -299,7 +519,9 @@ static NSView *YMSpacer(void) {
 }
 - (void)loadDisplayProfiles {
     self.displayProfiles = [NSMutableArray array];
-    id saved = [NSUserDefaults.standardUserDefaults objectForKey:@"NamedDisplayProfiles"];
+    id saved = self.displayProfilesPreferenceStore
+        ? self.displayProfilesPreferenceStore[@"NamedDisplayProfiles"]
+        : [NSUserDefaults.standardUserDefaults objectForKey:@"NamedDisplayProfiles"];
     NSMutableSet *ordinals = [NSMutableSet set];
     if ([saved isKindOfClass:NSArray.class]) {
         for (id value in saved) {
@@ -326,26 +548,20 @@ static NSView *YMSpacer(void) {
     for (YMManagedDisplay *profile in self.displayProfiles)
         [saved addObject:@{@"ordinal":@(profile.ordinal), @"name":profile.friendlyName,
                           @"width":@(profile.width), @"hiDPI":@(profile.hiDPI)}];
-    [NSUserDefaults.standardUserDefaults setObject:saved forKey:@"NamedDisplayProfiles"];
+    if (self.displayProfilesPreferenceStore)
+        self.displayProfilesPreferenceStore[@"NamedDisplayProfiles"] = saved;
+    else
+        [NSUserDefaults.standardUserDefaults setObject:saved forKey:@"NamedDisplayProfiles"];
 }
 - (void)selectProfile:(YMManagedDisplay *)profile {
-    if (!profile || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.displayOperationInProgress || self.appOperationInProgress) return;
+    if (!profile || self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.displayOperationInProgress || self.appOperationInProgress) return;
     self.selectedProfile = profile;
     self.virtualDisplay = profile.display;
     [self updateInventory];
 }
 - (void)addDisplay:(id)sender {
     (void)sender;
-    if (self.previewMode || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.displayOperationInProgress || self.appOperationInProgress) return;
-    NSUInteger ordinal = 1;
-    for (YMManagedDisplay *profile in self.displayProfiles) ordinal = MAX(ordinal, profile.ordinal + 1);
-    if (ordinal > UINT16_MAX) { self.detailLabel.stringValue = @"已达到可用的屏幕编号上限。"; return; }
-    NSString *name = ordinal == 2 ? @"GrokBot" : [NSString stringWithFormat:@"Agent %lu", (unsigned long)ordinal];
-    YMManagedDisplay *profile = [self newProfileWithOrdinal:ordinal name:name width:1920 height:1080 hiDPI:NO];
-    [self.displayProfiles addObject:profile];
-    [self saveDisplayProfiles];
-    [self selectProfile:profile];
-    [self create:nil];
+    [self presentProfileEditorForOrdinal:0 mode:YMDisplayProfileEditorModeCreate];
 }
 - (void)buildMenu {
     if (self.previewMode) return;
@@ -387,36 +603,62 @@ static NSView *YMSpacer(void) {
         screen.submenu = submenu; [menu addItem:screen];
     }
     if (!active.count) [menu addItem:[[NSMenuItem alloc] initWithTitle:@"尚无运行中的虚拟屏" action:nil keyEquivalent:@""]];
-    NSMenuItem *add = [self menuItem:@"添加或启动虚拟屏…" action:nil profile:nil];
-    add.submenu = [self addingDisplayMenu];
-    [menu addItem:add];
+    [menu addItem:[self menuItem:@"添加或启动虚拟屏…" action:@selector(showWindow:) profile:nil]];
     if (self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay)
         [menu addItem:[self menuItem:@"微信返回原显示器" action:@selector(wechatRestore:) profile:nil]];
+    if (self.topologyRecoverySnapshot)
+        [menu addItem:[self menuItem:@"重试恢复显示排列…" action:@selector(retryTopologyRecovery:) profile:nil]];
     if (self.armed || self.layoutChangedForTrial || self.recoveryRequested)
         [menu addItem:[self menuItem:@"恢复实体显示器" action:@selector(restore:) profile:nil]];
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"yomado %@", YMAppVersion()] action:nil keyEquivalent:@""]];
-    [menu addItem:[self menuItem:self.updateChecker.checking ? @"正在检查更新…" : @"检查更新…" action:@selector(checkForUpdates:) profile:nil]];
+    [menu addItem:[self menuItem:self.automaticUpdater.busy ? [self updateStatusText] : @"检查并安装更新…" action:@selector(checkForUpdates:) profile:nil]];
+    NSMenuItem *automatic = [self menuItem:@"自动下载并安装更新" action:@selector(toggleAutomaticUpdates:) profile:nil];
+    automatic.state = self.automaticUpdater.automaticUpdatesEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:automatic];
+    if (self.automaticUpdater.canCancel) [menu addItem:[self menuItem:@"取消此次更新" action:@selector(cancelUpdate:) profile:nil]];
+    if (self.updateRecoveryFailed) {
+        [menu addItem:[self menuItem:@"重试恢复更新前工作区…" action:@selector(retryUpdateRecovery:) profile:nil]];
+        [menu addItem:[self menuItem:@"放弃未完成的恢复记录…" action:@selector(discardUpdateRecovery:) profile:nil]];
+    }
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItem:[self menuItem:@"完全退出 yomado" action:@selector(quit:) profile:nil]];
 }
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     if (item.action == @selector(checkForUpdates:))
-        return !self.previewMode && !self.updateChecker.checking && !self.updateAlert && !self.window.attachedSheet;
+        return !self.previewMode && self.automaticUpdater.canCheck && !self.updateRecoveryFailed && !self.updateWorkspaceBusy;
+    if (item.action == @selector(quit:) || item.action == @selector(closeProfile:)
+        || item.action == @selector(closeManagedDisplayFromMenu:)
+        || item.action == @selector(renameManagedDisplayFromMenu:)
+        || item.action == @selector(startManagedDisplayFromMenu:)
+        || item.action == @selector(setManagedDisplayResolutionFromMenu:)
+        || item.action == @selector(toggleManagedDisplayHiDPIFromMenu:)
+        || item.action == @selector(addDisplay:))
+        return !self.profileEditor && self.window.attachedSheet == nil;
     return YES;
 }
-- (void)openWebsite:(id)sender {
-    (void)sender;
-    if (!self.previewMode) [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"https://yomado.app/"]];
+- (void)openProductURL:(NSString *)address {
+    if (self.previewMode) return;
+    NSURL *url = [NSURL URLWithString:address];
+    if ([NSWorkspace.sharedWorkspace openURL:url]) return;
+    self.updateRecoveryMessage = @"无法打开默认浏览器，可复制链接后打开";
+    [self refreshUpdateUI];
+    if (self.window.attachedSheet) return;
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = @"无法打开链接";
+    alert.informativeText = address;
+    [alert addButtonWithTitle:@"复制链接"];
+    [alert addButtonWithTitle:@"取消"];
+    [self showWindow:nil];
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn) return;
+        [NSPasteboard.generalPasteboard clearContents];
+        [NSPasteboard.generalPasteboard setString:address forType:NSPasteboardTypeString];
+    }];
 }
-- (void)openSource:(id)sender {
-    (void)sender;
-    if (!self.previewMode) [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"https://github.com/chekusu/yomado"]];
-}
-- (void)openLicense:(id)sender {
-    (void)sender;
-    if (!self.previewMode) [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"https://github.com/chekusu/yomado/blob/main/LICENSE"]];
-}
+- (void)openWebsite:(id)sender { (void)sender; [self openProductURL:@"https://yomado.app/"]; }
+- (void)openSource:(id)sender { (void)sender; [self openProductURL:@"https://github.com/chekusu/yomado"]; }
+- (void)openLicense:(id)sender { (void)sender; [self openProductURL:@"https://github.com/chekusu/yomado/blob/main/LICENSE"]; }
 - (NSButton *)footerLink:(NSString *)title action:(SEL)action tooltip:(NSString *)tooltip {
     NSButton *button = [NSButton buttonWithTitle:title target:self action:action];
     button.bordered = NO;
@@ -427,52 +669,233 @@ static NSView *YMSpacer(void) {
     [button setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
     return button;
 }
+- (NSString *)updateStatusText {
+    if (self.updateRecoveryMessage.length) return self.updateRecoveryMessage;
+    NSString *version = self.automaticUpdater.latestVersion ?: @"";
+    switch (self.automaticUpdater.status) {
+        case YMAutomaticUpdateChecking: return @"正在检查更新…";
+        case YMAutomaticUpdateDownloading: return self.automaticUpdater.progress < 0 ? @"正在下载更新…" : [NSString stringWithFormat:@"正在下载 %@ · %.0f%%", version, self.automaticUpdater.progress * 100];
+        case YMAutomaticUpdateExtracting: return @"正在校验并展开更新…";
+        case YMAutomaticUpdatePreparing: return @"正在保存工作屏与窗口位置…";
+        case YMAutomaticUpdateInstalling: return @"正在安装更新，即将重新打开…";
+        case YMAutomaticUpdateUpToDate: return @"已是最新版本";
+        case YMAutomaticUpdateBlocked: return [NSString stringWithFormat:@"更新已暂缓 · %@", self.automaticUpdater.lastError.localizedDescription ?: @"请稍后重试"];
+        case YMAutomaticUpdateFailed: return [NSString stringWithFormat:@"更新失败 · %@", self.automaticUpdater.lastError.localizedDescription ?: @"请稍后重试"];
+        case YMAutomaticUpdateCancelled: return @"已取消此次更新";
+        case YMAutomaticUpdateInstalled: return @"更新已完成";
+        case YMAutomaticUpdateIdle: return @"检查并安装更新";
+    }
+}
+- (void)refreshUpdateUI {
+    NSString *status = [self updateStatusText];
+    self.updateStatusLabel.stringValue = status;
+    self.updateStatusLabel.toolTip = status;
+    self.updateStatusRow.hidden = !self.updateRecoveryMessage.length && self.automaticUpdater.status == YMAutomaticUpdateIdle;
+    self.updateButton.action = self.updateRecoveryFailed ? @selector(retryUpdateRecovery:) : @selector(checkForUpdates:);
+    self.updateButton.enabled = !self.previewMode && !self.updateWorkspaceBusy && (self.updateRecoveryFailed || self.automaticUpdater.canCheck);
+    self.updateButton.toolTip = self.updateRecoveryFailed ? @"重试恢复更新前工作区" : self.automaticUpdater.canCheck ? @"检查、下载并安装更新" : status;
+    [self.updateButton setAccessibilityLabel:self.updateButton.toolTip];
+    self.automaticUpdatesButton.state = self.automaticUpdater.automaticUpdatesEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.automaticUpdatesButton.enabled = !self.previewMode && !self.updateWorkspaceBusy;
+    self.cancelUpdateButton.hidden = !self.automaticUpdater.canCancel;
+    self.updateProgress.hidden = !self.automaticUpdater.busy;
+    self.updateProgress.indeterminate = self.automaticUpdater.progress < 0;
+    self.updateProgress.doubleValue = MAX(0, self.automaticUpdater.progress * 100);
+    if (self.automaticUpdater.busy) [self.updateProgress startAnimation:nil]; else [self.updateProgress stopAnimation:nil];
+}
+- (NSArray<NSDictionary *> *)updateProfileInventory {
+    NSMutableArray *profiles = [NSMutableArray array];
+    for (YMManagedDisplay *profile in [self activeProfiles])
+        [profiles addObject:@{@"ordinal":@(profile.ordinal), @"displayID":@(profile.display.displayID),
+            @"width":@(profile.width), @"height":@(profile.height), @"hiDPI":@(profile.hiDPI)}];
+    return profiles;
+}
+- (BOOL)prepareUpdateRestart:(NSError **)error {
+    // The dedicated WeChat recovery path still retains its exact tracked AX
+    // window and pause state in this process. Do not replace that protection
+    // with a generic window journal or silently reselect a window after restart.
+    if (self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay) {
+        if (error) *error = [NSError errorWithDomain:YMAutomaticUpdaterErrorDomain code:106
+            userInfo:@{NSLocalizedDescriptionKey:@"微信还有待恢复记录，请先让微信返回原显示器，再重新检查更新。"}];
+        return NO;
+    }
+    if (self.previewMode || self.displayOperationInProgress || self.appOperationInProgress
+        || self.topologyRecoverySnapshot || self.armed || self.preparing || self.restoring
+        || self.layoutChangedForTrial || self.recoveryRequested || self.updateRecoveryFailed || self.window.attachedSheet) {
+        if (error) *error = [NSError errorWithDomain:YMAutomaticUpdaterErrorDomain code:100
+            userInfo:@{NSLocalizedDescriptionKey:@"工作区操作或弹窗尚未结束，保留当前窗口并稍后重试。"}];
+        return NO;
+    }
+    if (![self.updateRecovery cancelPreparedRestart:error]) return NO;
+    NSArray *origins = [self.appWorkspace restartOriginCheckpointsWithError:error];
+    if (!origins) return NO;
+    if (![self.updateRecovery prepareRestartWithProfiles:[self updateProfileInventory]
+        targetVersion:self.automaticUpdater.latestVersion targetBuild:self.automaticUpdater.latestBuild
+        originCheckpoints:origins error:error]) return NO;
+    self.updateWorkspaceBusy = YES;
+    [self updateInventory];
+    return YES;
+}
+- (void)automaticUpdateStateDidChange {
+    if (self.automaticUpdater.status == YMAutomaticUpdateChecking && !self.updateRecoveryFailed && !self.pendingUpdateProfiles)
+        self.updateRecoveryMessage = nil;
+    // A failed startup claim may leave profiles unset but still owns a durable
+    // recovery record. Background checks must retain it for an explicit retry.
+    if (!self.automaticUpdater.busy && !self.automaticUpdater.installationPending
+        && !self.pendingUpdateProfiles && !self.updateRecoveryFailed) {
+        self.updateWorkspaceBusy = NO;
+        [self.updateRecovery cancelPreparedRestart:NULL];
+    }
+    [self refreshUpdateUI];
+    [self updateInventory];
+}
+- (void)beginUpdater {
+    if (self.automaticUpdater || self.previewMode) return;
+    self.automaticUpdater = [[YMAutomaticUpdater alloc] initWithHostBundle:NSBundle.mainBundle];
+    __weak ADController *weakSelf = self;
+    self.automaticUpdater.stateDidChange = ^{ [weakSelf automaticUpdateStateDidChange]; };
+    self.automaticUpdater.prepareForInstallation = ^(YMUpdatePreparationCompletion completion) {
+        ADController *owner = weakSelf;
+        NSError *error = nil;
+        BOOL ready = owner && [owner prepareUpdateRestart:&error];
+        completion(ready, error);
+    };
+    NSError *error = nil;
+    if (![self.automaticUpdater startWithError:&error]) self.updateRecoveryMessage = error.localizedDescription;
+    [self refreshUpdateUI];
+}
 - (void)checkForUpdates:(id)sender {
     (void)sender;
-    if (self.previewMode || self.updateChecker.checking || self.updateAlert || self.window.attachedSheet) return;
-    if (!self.updateChecker) self.updateChecker = [[YMUpdateChecker alloc] initWithCurrentVersion:YMAppVersion()];
-    self.updateButton.enabled = NO;
-    self.updateButton.toolTip = @"正在检查更新…";
-    [self.updateButton setAccessibilityLabel:@"正在检查更新"];
-    __weak ADController *weakSelf = self;
-    [self.updateChecker checkWithCompletion:^(YMUpdateResult *result, NSError *error) {
-        ADController *controller = weakSelf;
-        if (!controller) return;
-        controller.updateButton.toolTip = @"检查更新";
-        [controller.updateButton setAccessibilityLabel:@"检查更新"];
-        NSAlert *alert = [[NSAlert alloc] init];
-        controller.updateAlert = alert;
-        BOOL available = !error && result.status == YMUpdateStatusAvailable;
-        if (error) {
-            alert.alertStyle = NSAlertStyleWarning;
-            alert.messageText = @"暂时无法检查更新";
-            alert.informativeText = error.localizedDescription;
-            [alert addButtonWithTitle:@"重试"];
-            [alert addButtonWithTitle:@"取消"];
-        } else if (available) {
-            alert.messageText = [NSString stringWithFormat:@"发现新版本 yomado %@", result.latestVersion];
-            alert.informativeText = [NSString stringWithFormat:@"当前版本 %@%@。可前往 GitHub 查看版本说明并下载。请在退出旧版前保存工作、返回虚拟屏里的窗口。", result.currentVersion, result.prerelease ? @"，新版本为实验版" : @""];
-            [alert addButtonWithTitle:@"查看更新"];
-            [alert addButtonWithTitle:@"稍后"];
-        } else {
-            alert.messageText = @"已是最新版本";
-            alert.informativeText = [NSString stringWithFormat:@"yomado %@ · 已检查正式版与实验版更新。", result.currentVersion];
-            [alert addButtonWithTitle:@"好"];
+    if (self.previewMode || self.updateRecoveryFailed || self.updateWorkspaceBusy) return;
+    self.updateRecoveryMessage = nil;
+    [self showWindow:nil];
+    [self.automaticUpdater checkNow];
+    [self refreshUpdateUI];
+}
+- (void)toggleAutomaticUpdates:(id)sender {
+    (void)sender;
+    if (self.previewMode || self.updateWorkspaceBusy) return;
+    self.automaticUpdater.automaticUpdatesEnabled = !self.automaticUpdater.automaticUpdatesEnabled;
+    [self refreshUpdateUI];
+}
+- (void)cancelUpdate:(id)sender { (void)sender; [self.automaticUpdater cancel]; }
+- (void)failUpdateRecovery:(NSError *)error {
+    [self finishUpdateRecoveryWithError:error ?: [NSError errorWithDomain:YMAutomaticUpdaterErrorDomain code:105
+        userInfo:@{NSLocalizedDescriptionKey:@"未能确认工作区恢复完成，请通过菜单重试。"}]];
+}
+- (void)finishUpdateRecoveryWithError:(NSError *)error {
+    self.updateWorkspaceBusy = NO;
+    self.updateRecoveryFailed = error != nil;
+    self.updateRecoveryMessage = error ? [NSString stringWithFormat:@"工作区恢复已暂停 · %@", error.localizedDescription] : @"已更新并恢复工作屏与窗口位置";
+    if (!error) {
+        self.pendingUpdateProfiles = nil;
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        NSString *frame = [defaults stringForKey:@"UpdatePanelFrame"];
+        if (frame.length) [self.window setFrame:NSRectFromString(frame) display:NO];
+        if ([defaults boolForKey:@"UpdatePanelWasVisible"]) [self showWindow:nil];
+        [defaults removeObjectForKey:@"UpdatePanelFrame"];
+        [defaults removeObjectForKey:@"UpdatePanelWasVisible"];
+    }
+    [self updateInventory];
+    [self beginUpdater];
+    [self refreshUpdateUI];
+}
+- (void)restoreUpdateWorkspace {
+    self.updateRecovery = [[YMUpdateWorkspaceRecovery alloc] init];
+    NSError *error = nil;
+    NSArray *profiles = [self.updateRecovery pendingProfilesWithError:&error];
+    if (error) { [self failUpdateRecovery:error]; return; }
+    if (!profiles) { [self showWindow:nil]; [self beginUpdater]; return; }
+    self.pendingUpdateProfiles = profiles;
+    self.updateWorkspaceBusy = YES;
+    self.updateRecoveryMessage = @"正在恢复更新前的工作屏…";
+    [self refreshUpdateUI];
+    [self restoreUpdateProfileAtIndex:0];
+}
+- (void)retryUpdateRecovery:(id)sender {
+    (void)sender;
+    if (!self.updateRecoveryFailed || self.updateWorkspaceBusy || self.displayOperationInProgress || self.appOperationInProgress) return;
+    NSError *error = nil;
+    NSArray *profiles = self.pendingUpdateProfiles ?: [self.updateRecovery retryPendingProfilesWithError:&error];
+    if (!profiles || error) { [self finishUpdateRecoveryWithError:error ?: [NSError errorWithDomain:YMAutomaticUpdaterErrorDomain code:101 userInfo:@{NSLocalizedDescriptionKey:@"没有可恢复的更新记录。"}]]; return; }
+    self.pendingUpdateProfiles = profiles;
+    self.updateWorkspaceBusy = YES;
+    self.updateRecoveryFailed = NO;
+    [self restoreUpdateProfileAtIndex:0];
+}
+- (void)discardUpdateRecovery:(id)sender {
+    (void)sender;
+    if (!self.updateRecoveryFailed || self.updateWorkspaceBusy || self.window.attachedSheet) return;
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = @"放弃恢复记录？";
+    alert.informativeText = @"当前屏幕与窗口保持不变。更新前保存的位置将被移除，之后可以重新检查更新。";
+    [alert addButtonWithTitle:@"取消"];
+    [alert addButtonWithTitle:@"放弃记录"];
+    [self showWindow:nil];
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertSecondButtonReturn) return;
+        NSError *error = nil;
+        if (![self.updateRecovery discardRecoveryAfterUserRequest:&error]) { [self failUpdateRecovery:error]; return; }
+        self.pendingUpdateProfiles = nil;
+        self.updateRecoveryFailed = NO;
+        self.updateRecoveryMessage = @"已放弃恢复记录；当前窗口保持不变";
+        [self refreshUpdateUI];
+    }];
+}
+- (void)restoreUpdateProfileAtIndex:(NSUInteger)index {
+    if (index == self.pendingUpdateProfiles.count) {
+        NSError *error = nil;
+        if (![self.updateRecovery restoreWithProfiles:[self updateProfileInventory] error:&error]) {
+            [self failUpdateRecovery:error]; return;
         }
-        [controller showWindow:nil];
-        [alert beginSheetModalForWindow:controller.window completionHandler:^(NSModalResponse response) {
-            ADController *owner = weakSelf;
-            if (!owner) return;
-            owner.updateAlert = nil;
-            owner.updateButton.enabled = YES;
-            if (response != NSAlertFirstButtonReturn) return;
-            if (error) [owner checkForUpdates:nil];
-            else if (available) [NSWorkspace.sharedWorkspace openURL:result.releaseURL];
-        }];
+        // Refresh owned display IDs before adopting the persisted return points;
+        // the initial launch inventory predates recreation of these screens.
+        [self updateInventory];
+        if (![self.appWorkspace adoptRestartOriginCheckpoints:self.updateRecovery.restoredOriginCheckpoints error:&error]
+            || ![self.updateRecovery completeRestoration:&error]) {
+            [self failUpdateRecovery:error]; return;
+        }
+        [self finishUpdateRecoveryWithError:nil]; return;
+    }
+    NSDictionary *saved = self.pendingUpdateProfiles[index];
+    YMManagedDisplay *profile = nil;
+    for (YMManagedDisplay *candidate in self.displayProfiles)
+        if (candidate.ordinal == [saved[@"ordinal"] unsignedIntegerValue]) { profile = candidate; break; }
+    if (!profile || profile.width != [saved[@"width"] unsignedIntegerValue]
+        || profile.height != [saved[@"height"] unsignedIntegerValue] || profile.hiDPI != [saved[@"hiDPI"] boolValue]) {
+        [self finishUpdateRecoveryWithError:[NSError errorWithDomain:YMAutomaticUpdaterErrorDomain code:102
+            userInfo:@{NSLocalizedDescriptionKey:@"保存的工作屏配置已经改变，请在面板中检查。"}]]; return;
+    }
+    NSError *error = nil;
+    if (![self.updateRecovery verifyRestorationEnvironmentWithProfiles:[self updateProfileInventory] error:&error]) { [self failUpdateRecovery:error]; return; }
+    YMDisplayTopologySnapshot *before = [self.displayTopology captureSnapshotWithError:&error];
+    if (!before) { [self failUpdateRecovery:error]; return; }
+    BOOL createdNow = !profile.display.isCreated;
+    if (createdNow && ![profile.display createWithWidth:profile.width height:profile.height hiDPI:profile.hiDPI name:[self titleForProfile:profile] error:&error]) {
+        [self failUpdateRecovery:error]; return;
+    }
+    YMDisplayTopology *topology = self.displayTopology;
+    CGDirectDisplayID ident = profile.display.displayID;
+    [self performTopologyOperation:^BOOL(NSError **failure) {
+        if (createdNow && ![topology configureAndVerifyNewDisplay:ident width:profile.width height:profile.height hiDPI:profile.hiDPI baseline:before error:failure]) return NO;
+        YMDisplayTopologySnapshot *layout = [topology captureSnapshotWithError:failure];
+        if (!layout) return NO;
+        return [topology positionOwnedDisplays:@{@(ident):saved[@"bounds"]} baseline:layout error:failure];
+    } completion:^(BOOL ready, NSError *failure) {
+        // Keep recreated displays on failure; removing one could displace a
+        // window macOS already put there. Retry never touches unrelated windows.
+        if (!ready) { [self failUpdateRecovery:failure]; return; }
+        profile.topologyVerified = YES;
+        [self powerAssertions:YES];
+        if (self.systemAssertion == kIOPMNullAssertionID || self.displayAssertion == kIOPMNullAssertionID) {
+            [self finishUpdateRecoveryWithError:[NSError errorWithDomain:YMAutomaticUpdaterErrorDomain code:103 userInfo:@{NSLocalizedDescriptionKey:@"无法保持工作屏运行，恢复已暂停。"}]]; return;
+        }
+        [self restoreUpdateProfileAtIndex:index + 1];
     }];
 }
 - (void)showProfile:(NSMenuItem *)sender { [self selectProfile:sender.representedObject]; [self showWindow:nil]; }
 - (void)closeProfile:(NSMenuItem *)sender {
+    if (self.profileEditor || self.window.attachedSheet) return;
     [self selectProfile:sender.representedObject];
     if (self.selectedProfile == sender.representedObject) [self stop:nil];
 }
@@ -480,9 +903,10 @@ static NSView *YMSpacer(void) {
 // recreated; close a display before changing its saved dimensions.
 - (BOOL)canPerformScreenMenuActionForProfile:(YMManagedDisplay *)profile {
     return !self.previewMode && profile && [self.displayProfiles containsObject:profile]
-        && !self.appOperationInProgress && !self.displayOperationInProgress
+        && !self.updateWorkspaceBusy && !self.appOperationInProgress && !self.displayOperationInProgress
         && !self.armed && !self.preparing && !self.restoring
-        && !self.layoutChangedForTrial && !self.recoveryRequested;
+        && !self.layoutChangedForTrial && !self.recoveryRequested
+        && !self.profileEditor && self.window.attachedSheet == nil;
 }
 - (void)startManagedDisplayFromMenu:(NSMenuItem *)sender {
     YMManagedDisplay *profile = sender.representedObject;
@@ -498,41 +922,160 @@ static NSView *YMSpacer(void) {
     [self selectProfile:profile];
     if (self.selectedProfile == profile) [self stop:nil];
 }
+- (YMDisplayProfileEditor *)makeDisplayProfileEditorWithMode:(YMDisplayProfileEditorMode)mode
+                                                       draft:(YMDisplayProfileDraft *)draft {
+    return [[YMDisplayProfileEditor alloc] initWithMode:mode draft:draft];
+}
+- (void)restoreProfileEditorFocus {
+    NSWindow *window = self.window;
+    if (!window) {
+        self.profileEditorOrigin = nil;
+        self.profileEditorFocusPending = NO;
+        return;
+    }
+    // Sheet/editor are already cleared; refresh enabled from the latest gates so
+    // focus does not chase a control that updateInventory disabled while open.
+    BOOL busy = self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring
+        || self.layoutChangedForTrial || self.recoveryRequested || self.displayOperationInProgress
+        || self.appOperationInProgress;
+    BOOL actionable = !self.previewMode && !busy && !self.topologyRecoverySnapshot
+        && !self.profileEditor && self.window.attachedSheet == nil;
+    if (self.addDisplayButton) {
+        self.addDisplayButton.enabled = actionable;
+    }
+    // Completion can run while attachedSheet is still set. Keep origin and wait for
+    // the real detach instead of settling on nil behind the sheet gate. Queue at most
+    // one async probe; further attempts stay pending for updateInventory.
+    if (self.window.attachedSheet != nil) {
+        BOOL alreadyPending = self.profileEditorFocusPending;
+        self.profileEditorFocusPending = YES;
+        if (!alreadyPending) {
+            __weak ADController *weakSelf = self;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ADController *controller = weakSelf;
+                if (!controller || !controller.profileEditorFocusPending) return;
+                [controller restoreProfileEditorFocus];
+            });
+        }
+        return;
+    }
+    BOOL wasPending = self.profileEditorFocusPending;
+    self.profileEditorFocusPending = NO;
+    if (self.profileEditor != nil) return;
+    if (wasPending) {
+        id current = window.firstResponder;
+        if (current != nil && current != window) {
+            BOOL accepts = ![current respondsToSelector:@selector(acceptsFirstResponder)]
+                || [current acceptsFirstResponder];
+            BOOL enabled = ![current respondsToSelector:@selector(isEnabled)]
+                || [(NSControl *)current isEnabled];
+            id currentWindow = [current respondsToSelector:@selector(window)] ? [current window] : nil;
+            if (currentWindow == window && accepts && enabled
+                && current != (id)self.profileEditorOrigin
+                && current != (id)self.addDisplayButton) {
+                self.profileEditorOrigin = nil;
+                return;
+            }
+        }
+    }
+    // Refresh saved-row button permission before deciding origin vs fallback.
+    if (self.savedProfilesView) {
+        [self updateSavedProfilesPresentation];
+    } else {
+        NSView *pendingOrigin = self.profileEditorOrigin;
+        if (pendingOrigin && pendingOrigin.window == window
+            && [pendingOrigin respondsToSelector:@selector(setEnabled:)]) {
+            [(id)pendingOrigin setEnabled:actionable];
+        }
+    }
+    NSView *origin = self.profileEditorOrigin;
+    self.profileEditorOrigin = nil;
+    if (origin && origin.window == window && origin.acceptsFirstResponder
+        && (!([origin respondsToSelector:@selector(isEnabled)]) || [(NSControl *)origin isEnabled])) {
+        [window makeFirstResponder:origin];
+        return;
+    }
+    if (self.addDisplayButton && self.addDisplayButton.window == window && self.addDisplayButton.enabled) {
+        [window makeFirstResponder:self.addDisplayButton];
+        return;
+    }
+    [window makeFirstResponder:nil];
+}
+- (void)presentProfileEditorForOrdinal:(NSUInteger)ordinal mode:(YMDisplayProfileEditorMode)mode {
+    if (mode != YMDisplayProfileEditorModeCreate && mode != YMDisplayProfileEditorModeEdit
+        && mode != YMDisplayProfileEditorModeRename) return;
+    if (mode == YMDisplayProfileEditorModeCreate) {
+        if (ordinal != 0) return;
+    } else if (!ordinal || ![self profileWithOrdinal:ordinal]) {
+        return;
+    }
+    if (![self profileActionsAvailableForEditor:nil]) return;
+    if (self.profileStartRejectionText.length) {
+        self.profileStartRejectionText = nil;
+        [self updateSavedProfilesPresentation];
+    }
+    YMManagedDisplay *target = mode == YMDisplayProfileEditorModeCreate ? nil : [self profileWithOrdinal:ordinal];
+    if (mode == YMDisplayProfileEditorModeEdit && target.display.isCreated) return;
+    YMDisplayProfileDraft *draft = mode == YMDisplayProfileEditorModeCreate
+        ? [[YMDisplayProfileDraft alloc] initWithName:@"" width:1920 hiDPI:NO]
+        : [[YMDisplayProfileDraft alloc] initWithName:target.friendlyName ?: @""
+                                                 width:target.width ?: 1920
+                                                 hiDPI:target.hiDPI];
+    YMDisplayProfileEditor *editor = [self makeDisplayProfileEditorWithMode:mode draft:draft];
+    if (!editor) return;
+    [self showWindow:nil];
+    NSWindow *parent = self.window;
+    if (!parent) return;
+    id currentResponder = parent.firstResponder;
+    self.profileEditorOrigin = [currentResponder isKindOfClass:NSView.class] ? currentResponder : self.addDisplayButton;
+    self.profileEditor = editor;
+    __weak ADController *weakController = self;
+    __weak YMDisplayProfileEditor *weakEditor = editor;
+    editor.submitHandler = ^BOOL(YMDisplayProfileDraft *submitted, NSError **error) {
+        ADController *controller = weakController;
+        YMDisplayProfileEditor *current = weakEditor;
+        if (!controller || !current) return NO;
+        return [controller acceptProfileDraft:submitted mode:mode ordinal:ordinal editor:current error:error];
+    };
+    editor.endHandler = ^(BOOL accepted) {
+        (void)accepted;
+        ADController *controller = weakController;
+        YMDisplayProfileEditor *current = weakEditor;
+        if (!controller || !current || controller.profileEditor != current) return;
+        controller.profileEditor = nil;
+        current.submitHandler = nil;
+        current.endHandler = nil;
+        [controller restoreProfileEditorFocus];
+    };
+    [editor beginSheetForWindow:parent];
+}
+- (void)updateSavedProfilesPresentation {
+    if (!self.savedProfilesView) return;
+    NSNumber *reveal = self.pendingProfileRevealOrdinal;
+    NSArray<YMSavedDisplayProfileRow *> *rows = [self savedProfileRows];
+    NSWindow *window = self.window;
+    id previousResponder = window.firstResponder;
+    BOOL responderWasRow = [previousResponder isKindOfClass:NSView.class]
+        && [(NSView *)previousResponder isDescendantOf:self.savedProfilesView];
+    [self.savedProfilesView updateRows:rows revealOrdinal:reveal];
+    if (reveal) self.pendingProfileRevealOrdinal = nil;
+    if (responderWasRow) {
+        NSView *stillPresent = (NSView *)previousResponder;
+        if (!stillPresent.window || stillPresent.window != window || ![stillPresent isDescendantOf:self.savedProfilesView]) {
+            if (self.addDisplayButton.enabled) [window makeFirstResponder:self.addDisplayButton];
+            else [window makeFirstResponder:nil];
+        }
+    }
+    NSString *activity = [self profileActivityText];
+    if (self.profileActivityLabel) {
+        self.profileActivityLabel.stringValue = activity ?: @"";
+        self.profileActivityLabel.hidden = activity.length == 0;
+    }
+}
 - (void)renameManagedDisplayFromMenu:(NSMenuItem *)sender {
     YMManagedDisplay *profile = sender.representedObject;
-    if (![profile isKindOfClass:YMManagedDisplay.class] || ![self canPerformScreenMenuActionForProfile:profile]
-        || self.window.attachedSheet) return;
-    NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"给虚拟屏命名";
-    alert.informativeText = @"例如 Codex 或 GrokBot。名称会显示在屏幕和菜单栏中。";
-    [alert addButtonWithTitle:@"保存"];
-    [alert addButtonWithTitle:@"取消"];
-    NSTextField *input = [NSTextField textFieldWithString:profile.friendlyName ?: @""];
-    input.frame = NSMakeRect(0, 0, 300, 26);
-    input.placeholderString = @"1–60 个字符";
-    [input setAccessibilityLabel:@"虚拟屏名称"];
-    alert.accessoryView = input;
-    alert.window.initialFirstResponder = input;
-    __weak ADController *weakSelf = self;
-    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
-        ADController *controller = weakSelf;
-        if (response != NSAlertFirstButtonReturn || !controller
-            || ![controller canPerformScreenMenuActionForProfile:profile]) return;
-        NSString *name = [input.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (!name.length || name.length > 60
-            || [name rangeOfCharacterFromSet:NSCharacterSet.controlCharacterSet].location != NSNotFound) {
-            controller.statusLabel.stringValue = @"名称未保存";
-            controller.detailLabel.stringValue = @"请输入 1–60 个字符，且不含换行或控制字符。";
-            return;
-        }
-        profile.friendlyName = name;
-        [controller saveDisplayProfiles];
-        [controller updateInventory];
-        controller.statusLabel.stringValue = @"名称已保存";
-        controller.detailLabel.stringValue = profile.display.isCreated
-            ? @"界面中的名称已更新；系统显示器名称将在这块虚拟屏下次启动时更新。"
-            : @"下次启动这块虚拟屏时会使用新名称。";
-    }];
+    if (![profile isKindOfClass:YMManagedDisplay.class] || ![self canPerformScreenMenuActionForProfile:profile]) return;
+    [self presentProfileEditorForOrdinal:profile.ordinal mode:YMDisplayProfileEditorModeRename];
 }
 - (void)setManagedDisplayResolutionFromMenu:(NSMenuItem *)sender {
     NSDictionary *settings = sender.representedObject;
@@ -607,40 +1150,15 @@ static NSView *YMSpacer(void) {
     CGFloat bottom = [anchor isKindOfClass:YMAppWorkspaceView.class] ? anchor.bounds.size.width / ((YMAppWorkspaceView *)anchor).displayAspectRatio : 24;
     [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(MAX(18, anchor.bounds.size.width - 24), bottom) inView:anchor];
 }
-- (NSMenu *)addingDisplayMenu {
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"添加虚拟屏"];
-    menu.autoenablesItems = NO;
-    for (YMManagedDisplay *profile in self.displayProfiles) {
-        if (profile.display.isCreated) continue;
-        NSMenuItem *saved = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"%@ · 已关闭", [self titleForProfile:profile]]
-            action:nil keyEquivalent:@""];
-        saved.submenu = [self screenActionMenuForProfile:profile];
-        saved.enabled = YES;
-        [menu addItem:saved];
-    }
-    if (menu.numberOfItems) [menu addItem:NSMenuItem.separatorItem];
-    NSMenuItem *newDisplay = [self menuItem:@"新增虚拟屏" action:@selector(addDisplay:) profile:nil];
-    newDisplay.enabled = !self.appOperationInProgress && !self.displayOperationInProgress
-        && !self.armed && !self.preparing && !self.restoring && !self.layoutChangedForTrial && !self.recoveryRequested;
-    [menu addItem:newDisplay];
-    return menu;
-}
-- (void)addDisplayMenu:(id)sender {
-    if (self.previewMode) return;
-    NSView *anchor = [sender isKindOfClass:NSView.class] ? sender : self.addDisplayButton;
-    NSPoint location = NSMakePoint(0, anchor.isFlipped ? NSHeight(anchor.bounds) + 4 : -4);
-    [[self addingDisplayMenu] popUpMenuPositioningItem:nil atLocation:location inView:anchor];
-}
-
 - (void)buildWindow {
-    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1000, 410)
+    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1000, 620)
         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
         backing:NSBackingStoreBuffered defer:NO];
-    self.window.contentView = [[YMDocumentView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 410)];
+    self.window.contentView = [[YMDocumentView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 620)];
     self.window.title = @"yomado";
     self.window.titlebarAppearsTransparent = YES;
     self.window.titleVisibility = NSWindowTitleHidden;
-    self.window.contentMinSize = NSMakeSize(760, 370);
+    self.window.contentMinSize = NSMakeSize(760, 520);
     self.window.delegate = self.previewMode ? nil : self;
     self.window.releasedWhenClosed = NO;
     if (!self.previewMode) [self.window center];
@@ -664,7 +1182,7 @@ static NSView *YMSpacer(void) {
     [header addArrangedSubview:Label(@"yomado", 23, NSFontWeightSemibold)];
     NSStackView *introduction = YMStack(NSUserInterfaceLayoutOrientationVertical, 3);
     [introduction addArrangedSubview:Label(@"夜窗", 14, NSFontWeightMedium)];
-    NSTextField *tagline = Label(@"为视觉 Agent 留一块工作屏，让实体屏可以休息。", 11, NSFontWeightRegular);
+    NSTextField *tagline = Label(@"为视觉 Agent 留一块工作屏。", 11, NSFontWeightRegular);
     tagline.textColor = NSColor.secondaryLabelColor;
     [introduction addArrangedSubview:tagline];
     [header addArrangedSubview:introduction];
@@ -679,11 +1197,29 @@ static NSView *YMSpacer(void) {
     self.wechatRestoreButton.toolTip = @"微信返回原显示器";
     self.wechatRestoreButton.hidden = YES;
     [header addArrangedSubview:self.wechatRestoreButton];
-    self.addDisplayButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"plus" accessibilityDescription:@"添加虚拟屏"] target:self action:@selector(addDisplayMenu:)];
+    self.addDisplayButton = [NSButton buttonWithTitle:@"＋ 新建屏幕" target:self action:@selector(addDisplay:)];
     self.addDisplayButton.bezelStyle = NSBezelStyleAccessoryBarAction;
-    self.addDisplayButton.toolTip = @"添加或启动虚拟屏";
+    self.addDisplayButton.toolTip = @"新建虚拟屏";
+    [self.addDisplayButton setAccessibilityLabel:@"新建屏幕"];
     [header addArrangedSubview:self.addDisplayButton];
     [stack addArrangedSubview:header]; YMFillWidth(header, stack);
+
+    NSStackView *overviewHeader = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 10);
+    [overviewHeader addArrangedSubview:Label(@"屏幕总览", 13, NSFontWeightSemibold)];
+    self.statusPill = [[YMStatusPill alloc] initWithFrame:NSZeroRect];
+    self.statusPill.translatesAutoresizingMaskIntoConstraints = NO;
+    [overviewHeader addArrangedSubview:self.statusPill];
+    [overviewHeader addArrangedSubview:YMSpacer()];
+    self.inventoryLabel = Label(@"", 11, NSFontWeightRegular);
+    self.inventoryLabel.textColor = NSColor.secondaryLabelColor;
+    [overviewHeader addArrangedSubview:self.inventoryLabel];
+    [stack addArrangedSubview:overviewHeader]; YMFillWidth(overviewHeader, stack);
+
+    self.profileActivityLabel = Label(@"", 12, NSFontWeightMedium);
+    self.profileActivityLabel.textColor = NSColor.secondaryLabelColor;
+    self.profileActivityLabel.hidden = YES;
+    [stack addArrangedSubview:self.profileActivityLabel]; YMFillWidth(self.profileActivityLabel, stack);
+
     NSScrollView *board = [[NSScrollView alloc] init];
     board.translatesAutoresizingMaskIntoConstraints = NO;
     board.drawsBackground = NO;
@@ -691,21 +1227,74 @@ static NSView *YMSpacer(void) {
     board.autohidesScrollers = YES;
     self.applicationCards = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 14);
     self.applicationCards.alignment = NSLayoutAttributeTop;
-    self.applicationCards.distribution = NSStackViewDistributionFill;
+    self.applicationCards.distribution = NSStackViewDistributionGravityAreas;
     self.workspaceViews = [NSMutableDictionary dictionary];
     board.documentView = self.applicationCards;
     NSLayoutConstraint *preferredBoardWidth = [self.applicationCards.widthAnchor constraintEqualToAnchor:board.contentView.widthAnchor];
     preferredBoardWidth.priority = NSLayoutPriorityDefaultHigh;
     preferredBoardWidth.active = YES;
+    NSLayoutConstraint *boardMinHeight = [board.heightAnchor constraintGreaterThanOrEqualToConstant:210];
+    // Saved profiles and update status must not raise the declared window minimum.
+    boardMinHeight.priority = NSLayoutPriorityWindowSizeStayPut - 1;
     [NSLayoutConstraint activateConstraints:@[
         [self.applicationCards.leadingAnchor constraintEqualToAnchor:board.contentView.leadingAnchor],
         [self.applicationCards.topAnchor constraintEqualToAnchor:board.contentView.topAnchor],
         [self.applicationCards.widthAnchor constraintGreaterThanOrEqualToAnchor:board.contentView.widthAnchor],
         [self.applicationCards.heightAnchor constraintGreaterThanOrEqualToAnchor:board.contentView.heightAnchor],
-        [board.heightAnchor constraintGreaterThanOrEqualToConstant:210]
+        boardMinHeight
     ]];
     [stack addArrangedSubview:board]; YMFillWidth(board, stack);
-    [board setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationVertical];
+    // The board alone takes spare height, leaving the saved list and other
+    // rows at their preferred heights and card fitting unambiguous.
+    [board setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationVertical];
+    [self.applicationCards setHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationVertical];
+    [board setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                    forOrientation:NSLayoutConstraintOrientationVertical];
+
+    NSTextField *inputHint = Label(@"实体屏与虚拟屏仍共用键鼠与焦点；不会隔离 Agent 输入，也不会关闭实体显示器。", 11, NSFontWeightRegular);
+    inputHint.textColor = NSColor.secondaryLabelColor;
+    [stack addArrangedSubview:inputHint]; YMFillWidth(inputHint, stack);
+
+    self.savedProfilesView = [[YMSavedDisplayProfilesView alloc] initWithFrame:NSZeroRect];
+    __weak ADController *weakSelf = self;
+    self.savedProfilesView.onStart = ^(NSUInteger ordinal) {
+        ADController *controller = weakSelf;
+        if (!controller) return;
+        NSError *error = nil;
+        BOOL started = [controller startSavedProfileWithOrdinal:ordinal error:&error];
+        if (!started) {
+            NSString *message = nil;
+            if (error && [error.domain isEqualToString:@"dev.chekusu.yomado.profile"]) {
+                message = error.localizedDescription;
+            }
+            if (!message.length) message = @"当前无法启动虚拟屏，请稍后重试。";
+            YMManagedDisplay *profile = [controller profileWithOrdinal:ordinal];
+            if (profile && [controller.displayProfiles containsObject:profile] && !profile.display.isCreated) {
+                controller.profileStartRejectionText = nil;
+                profile.startFailureText = message;
+                controller.pendingProfileRevealOrdinal = @(ordinal);
+                [controller updateSavedProfilesPresentation];
+            } else {
+                controller.profileStartRejectionText = message;
+                [controller updateSavedProfilesPresentation];
+            }
+            return;
+        }
+        controller.profileStartRejectionText = nil;
+        [controller updateSavedProfilesPresentation];
+    };
+    self.savedProfilesView.onEdit = ^(NSUInteger ordinal) {
+        [weakSelf presentProfileEditorForOrdinal:ordinal mode:YMDisplayProfileEditorModeEdit];
+    };
+    [stack addArrangedSubview:self.savedProfilesView]; YMFillWidth(self.savedProfilesView, stack);
+    [self.savedProfilesView setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                                       forOrientation:NSLayoutConstraintOrientationVertical];
+    [self.savedProfilesView setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                                     forOrientation:NSLayoutConstraintOrientationVertical];
+
+    self.wechatStatusLabel = Label(@"", 11, NSFontWeightRegular);
+    self.wechatStatusLabel.hidden = YES;
+    [stack addArrangedSubview:self.wechatStatusLabel]; YMFillWidth(self.wechatStatusLabel, stack);
 
     NSStackView *footer = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 10);
     [footer addArrangedSubview:[self footerLink:@"yomado.app" action:@selector(openWebsite:) tooltip:@"官方网站 · https://yomado.app"]];
@@ -722,14 +1311,37 @@ static NSView *YMSpacer(void) {
     [self.updateButton.widthAnchor constraintEqualToConstant:24].active = YES;
     [self.updateButton.heightAnchor constraintEqualToConstant:24].active = YES;
     [footer addArrangedSubview:self.updateButton];
+    self.automaticUpdatesButton = [NSButton checkboxWithTitle:@"自动更新" target:self action:@selector(toggleAutomaticUpdates:)];
+    self.automaticUpdatesButton.controlSize = NSControlSizeSmall;
+    self.automaticUpdatesButton.font = [NSFont systemFontOfSize:11];
+    self.automaticUpdatesButton.toolTip = @"定期检查正式版；下载和校验后，安全恢复工作区并重新打开应用";
+    [footer addArrangedSubview:self.automaticUpdatesButton];
     [footer addArrangedSubview:YMSpacer()];
     [footer addArrangedSubview:[self footerLink:@"GitHub" action:@selector(openSource:) tooltip:@"开源代码 · github.com/chekusu/yomado"]];
     [footer addArrangedSubview:[self footerLink:@"MIT" action:@selector(openLicense:) tooltip:@"MIT 开源许可证"]];
     [stack addArrangedSubview:footer]; YMFillWidth(footer, stack);
+    self.updateStatusRow = YMStack(NSUserInterfaceLayoutOrientationHorizontal, 8);
+    self.updateStatusRow.hidden = YES;
+    self.updateProgress = [[NSProgressIndicator alloc] init];
+    self.updateProgress.style = NSProgressIndicatorStyleSpinning;
+    self.updateProgress.controlSize = NSControlSizeSmall;
+    [self.updateStatusRow addArrangedSubview:self.updateProgress];
+    self.updateStatusLabel = [NSTextField labelWithString:@""];
+    self.updateStatusLabel.font = [NSFont systemFontOfSize:11];
+    self.updateStatusLabel.textColor = NSColor.secondaryLabelColor;
+    self.updateStatusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.updateStatusLabel setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.updateStatusRow addArrangedSubview:self.updateStatusLabel];
+    self.cancelUpdateButton = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"xmark.circle" accessibilityDescription:@"取消此次更新"] target:self action:@selector(cancelUpdate:)];
+    self.cancelUpdateButton.bordered = NO;
+    self.cancelUpdateButton.toolTip = @"取消此次更新";
+    [self.updateStatusRow addArrangedSubview:self.cancelUpdateButton];
+    [stack addArrangedSubview:self.updateStatusRow]; YMFillWidth(self.updateStatusRow, stack);
 
     // Status messages are retained for recovery diagnostics, not permanent UI.
     self.statusLabel = Label(@"", 12, NSFontWeightRegular);
     self.detailLabel = Label(@"", 11, NSFontWeightRegular);
+    [self preparePanelPresenter];
 }
 - (void)displayParametersChanged:(NSNotification *)notification {
     (void)notification;
@@ -769,7 +1381,12 @@ static NSView *YMSpacer(void) {
     }
 }
 - (void)dropApplication:(NSDictionary *)payload targetDisplayID:(CGDirectDisplayID)targetID {
-    if (self.previewMode || self.armed || self.preparing || self.restoring || self.displayOperationInProgress || self.appOperationInProgress) return;
+    if (self.previewMode || self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring || self.displayOperationInProgress || self.appOperationInProgress) return;
+    YMManagedDisplay *destinationProfile = [self profileForDisplayID:targetID];
+    if (destinationProfile && ![self canMoveIntoProfile:destinationProfile]) {
+        [self reportApplicationError:nil fallback:@"这个虚拟屏的扩展模式或显示配置尚未通过检查，未移动任何窗口。请先恢复显示排列。"];
+        return;
+    }
     self.appOperationInProgress = YES;
     @try {
         NSURL *URL = [payload[@"applicationURL"] isKindOfClass:NSURL.class] ? payload[@"applicationURL"] : nil;
@@ -866,9 +1483,10 @@ static NSView *YMSpacer(void) {
     }];
     NSArray<NSNumber *> *ids = [displays valueForKey:@"displayID"];
     NSMutableArray<NSString *> *layoutSignature = [NSMutableArray array];
-    double logicalWidth = 0;
+    double logicalWidth = 0, logicalHeight = 0;
     for (NSDictionary *item in displays) {
         logicalWidth += [item[@"logicalWidth"] doubleValue];
+        logicalHeight = MAX(logicalHeight, [item[@"logicalHeight"] doubleValue]);
         [layoutSignature addObject:[NSString stringWithFormat:@"%@:%@:%@:%@:%@", item[@"displayID"], item[@"logicalWidth"], item[@"logicalHeight"], item[@"x"], item[@"y"]]];
     }
     if (![self.workspaceLayoutSignature isEqualToArray:layoutSignature]) {
@@ -892,7 +1510,17 @@ static NSView *YMSpacer(void) {
             };
             [self.applicationCards addArrangedSubview:view];
             CGFloat fraction = [item[@"logicalWidth"] doubleValue] / MAX(1, logicalWidth);
-            [view.widthAnchor constraintEqualToAnchor:self.applicationCards.widthAnchor multiplier:fraction constant:-14.0 * (CGFloat)(displays.count - 1) * fraction].active = YES;
+            NSLayoutConstraint *fillWidth = [view.widthAnchor constraintEqualToAnchor:self.applicationCards.widthAnchor multiplier:fraction constant:-14.0 * (CGFloat)(displays.count - 1) * fraction];
+            // Both card constraints stay below the window's stay-put priority, so
+            // cards shrink, or the board scrolls, rather than the window growing.
+            fillWidth.priority = NSLayoutPriorityWindowSizeStayPut - 2;
+            fillWidth.active = YES;
+            // Fit the tallest display to the visible board so every card keeps one
+            // shared scale. The required minimum width wins in a very small window.
+            NSLayoutConstraint *fitHeight = [view.heightAnchor constraintLessThanOrEqualToAnchor:self.applicationCards.enclosingScrollView.contentView.heightAnchor
+                multiplier:[item[@"logicalHeight"] doubleValue] / MAX(1, logicalHeight)];
+            fitHeight.priority = NSLayoutPriorityWindowSizeStayPut - 1;
+            fitHeight.active = YES;
             [view.widthAnchor constraintGreaterThanOrEqualToConstant:140].active = YES;
             self.workspaceViews[@(displayID)] = view;
         }
@@ -914,7 +1542,8 @@ static NSView *YMSpacer(void) {
         }
         BOOL trusted = self.previewMode ? YES : self.appWorkspace.accessibilityTrusted;
         view.statusText = @"";
-        BOOL ready = !self.armed && !self.preparing && !self.restoring && !self.displayOperationInProgress && !self.appOperationInProgress;
+        view.acceptsApplications = self.previewMode || !profile || [self canMoveIntoProfile:profile];
+        BOOL ready = !self.updateWorkspaceBusy && !self.armed && !self.preparing && !self.restoring && !self.displayOperationInProgress && !self.appOperationInProgress;
         [view updateRows:rows virtualDisplayAvailable:ready accessibilityTrusted:trusted];
     }
 }
@@ -939,10 +1568,15 @@ static NSView *YMSpacer(void) {
     if (self.previewMode) return;
     [self dropApplication:@{@"bundleIdentifier":@"com.tencent.xinWeChat", @"sourceDisplayID":@(self.wechatDisplayID)} targetDisplayID:0];
 }
+- (void)preparePanelPresenter {
+    [self.panelPresenter invalidate];
+    self.panelPresenter = (!self.previewMode && self.window)
+        ? [[YMControlPanelPresenter alloc] initWithWindow:self.window] : nil;
+}
 - (void)showWindow:(id)sender {
     (void)sender;
     if (self.previewMode) return;
-    YMPresentControlPanel(self.window);
+    [self.panelPresenter open];
 }
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)application hasVisibleWindows:(BOOL)hasVisibleWindows {
     (void)application;
@@ -950,12 +1584,28 @@ static NSView *YMSpacer(void) {
     [self showWindow:nil];
     return NO;
 }
-- (BOOL)windowShouldClose:(NSWindow *)window { [window orderOut:nil]; return NO; }
+- (BOOL)windowShouldClose:(NSWindow *)window {
+    if (window == self.window && !self.previewMode) {
+        [self.panelPresenter closeWindow:window];
+        return NO;
+    }
+    [window orderOut:nil];
+    return NO;
+}
+- (NSArray<NSDictionary *> *)controllerDisplaySnapshot {
+    return DisplaySnapshot();
+}
 - (void)updateInventory {
     if (self.updatingInventory) return;
     self.updatingInventory = YES;
     @try {
-        NSArray *snapshot = self.previewMode ? self.previewSnapshot : DisplaySnapshot();
+        NSArray *snapshot;
+        if (self.previewMode)
+            snapshot = self.previewSnapshot;
+        else if (self.inventorySnapshotProvider)
+            snapshot = self.inventorySnapshotProvider();
+        else
+            snapshot = DisplaySnapshot();
         if (!self.previewMode) {
             [self refreshRecoveryTargetWithSnapshot:snapshot];
             NSMutableArray *ids = [NSMutableArray array];
@@ -970,9 +1620,14 @@ static NSView *YMSpacer(void) {
             if ([item[@"isVirtual"] boolValue]) virtualCount++; else physicalCount++;
         }
         self.inventoryLabel.stringValue = [NSString stringWithFormat:@"%lu 块实体屏 · %lu 块虚拟屏", (unsigned long)physicalCount, (unsigned long)virtualCount];
-        BOOL busy = self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested || self.displayOperationInProgress || self.appOperationInProgress;
-        self.addDisplayButton.enabled = !self.previewMode && !busy;
-        self.statusPill.text = busy ? @"正在更新" : virtualCount ? @"工作屏已就绪" : @"尚未启动";
+        BOOL busy = self.updateWorkspaceBusy || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested || self.displayOperationInProgress || self.appOperationInProgress;
+        self.addDisplayButton.enabled = !self.previewMode && !busy && !self.topologyRecoverySnapshot
+            && !self.profileEditor && self.window.attachedSheet == nil;
+        [self updateSavedProfilesPresentation];
+        if (self.profileEditorFocusPending && !self.profileEditor && self.window.attachedSheet == nil) {
+            [self restoreProfileEditorFocus];
+        }
+        self.statusPill.text = busy ? @"正在更新" : self.topologyRecoverySnapshot ? @"显示排列待恢复" : virtualCount ? @"工作屏已就绪" : @"尚未启动";
         self.statusPill.tint = busy ? NSColor.systemOrangeColor : virtualCount ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
         if (self.previewMode) {
             self.permissionContainer.hidden = YES;
@@ -1034,88 +1689,236 @@ static NSView *YMSpacer(void) {
     if (err != kCGErrorSuccess) { CGCancelDisplayConfiguration(config); return NO; }
     return CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly) == kCGErrorSuccess;
 }
-- (BOOL)placeDisplay:(VDVirtualDisplay *)display afterSnapshot:(NSArray<NSDictionary *> *)before mainDisplay:(CGDirectDisplayID)mainDisplay {
-    if (self.previewMode || !display.isCreated || !ADDisplayActive(display.displayID)) return NO;
-    NSNumber *right = YMDesktopRightEdge(before);
-    if (!right || !mainDisplay || !ADDisplayActive(mainDisplay)) return NO;
-    CGDisplayConfigRef config = NULL;
-    if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess || !config) return NO;
-    CGError error = kCGErrorSuccess;
-    // macOS can recall a cached virtual layout during creation. Restore only
-    // the exact origins captured immediately before this operation, including
-    // sibling virtual displays, then append the new one to the frozen edge.
-    for (NSDictionary *item in before) {
-        CGDirectDisplayID ident = [item[@"displayID"] unsignedIntValue];
-        if (![item[@"isActive"] boolValue] || !ADDisplayActive(ident)) continue;
-        error = CGConfigureDisplayOrigin(config, ident, [item[@"x"] intValue], [item[@"y"] intValue]);
-        if (error != kCGErrorSuccess) break;
+- (BOOL)profileActionsAvailableForEditor:(YMDisplayProfileEditor *)editor {
+    if (self.previewMode || self.updateWorkspaceBusy || self.appOperationInProgress || self.displayOperationInProgress
+        || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested
+        || self.topologyRecoverySnapshot || self.profileEditorCommitInProgress) return NO;
+    id attached = self.window.attachedSheet;
+    if (editor) {
+        if (editor != self.profileEditor) return NO;
+        if (attached && attached != editor.window) return NO;
+        return YES;
     }
-    if (error == kCGErrorSuccess) error = CGConfigureDisplayOrigin(config, display.displayID, right.intValue, 0);
-    if (error != kCGErrorSuccess) { CGCancelDisplayConfiguration(config); return NO; }
-    return CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly) == kCGErrorSuccess;
+    return attached == nil;
 }
-- (BOOL)layoutMatchesSnapshot:(NSArray<NSDictionary *> *)before mainDisplay:(CGDirectDisplayID)mainDisplay appended:(VDVirtualDisplay *)display {
-    if (CGMainDisplayID() != mainDisplay || !ADDisplayActive(display.displayID)) return NO;
-    NSNumber *right = YMDesktopRightEdge(before);
-    CGRect virtualBounds = CGDisplayBounds(display.displayID);
-    if (!right || virtualBounds.origin.x != right.doubleValue || virtualBounds.origin.y != 0) return NO;
-    for (NSDictionary *item in before) {
-        if (![item[@"isActive"] boolValue]) continue;
-        CGDirectDisplayID ident = [item[@"displayID"] unsignedIntValue];
-        CGRect bounds = CGDisplayBounds(ident);
-        if (!ADDisplayActive(ident) || bounds.origin.x != [item[@"x"] doubleValue] || bounds.origin.y != [item[@"y"] doubleValue]) return NO;
+- (YMManagedDisplay *)profileWithOrdinal:(NSUInteger)ordinal {
+    if (!ordinal) return nil;
+    for (YMManagedDisplay *profile in self.displayProfiles)
+        if (profile.ordinal == ordinal) return profile;
+    return nil;
+}
+- (void)failProfileRequest:(NSError **)error message:(NSString *)message {
+    if (error) *error = [NSError errorWithDomain:@"dev.chekusu.yomado.profile" code:1
+        userInfo:@{NSLocalizedDescriptionKey:message ?: @"当前无法完成该操作，请稍后重试。"}];
+}
+- (BOOL)acceptProfileDraft:(YMDisplayProfileDraft *)draft
+                      mode:(YMDisplayProfileEditorMode)mode
+                   ordinal:(NSUInteger)ordinal
+                    editor:(YMDisplayProfileEditor *)editor
+                     error:(NSError **)error {
+    if (mode != YMDisplayProfileEditorModeCreate && mode != YMDisplayProfileEditorModeEdit
+        && mode != YMDisplayProfileEditorModeRename) {
+        [self failProfileRequest:error message:@"不支持的编辑模式。"];
+        return NO;
     }
-    return YES;
+    if (mode == YMDisplayProfileEditorModeCreate) {
+        if (ordinal != 0) { [self failProfileRequest:error message:@"新建请求无效。"]; return NO; }
+    } else if (!ordinal) {
+        [self failProfileRequest:error message:@"未找到要编辑的虚拟屏。"];
+        return NO;
+    }
+    if (!editor || editor != self.profileEditor || self.profileEditorCommitInProgress) {
+        [self failProfileRequest:error message:@"配置表单已失效，请关闭后重试。"];
+        return NO;
+    }
+    if (![self profileActionsAvailableForEditor:editor]) {
+        [self failProfileRequest:error message:@"当前无法保存配置，请稍后重试。"];
+        return NO;
+    }
+    BOOL validateSettings = mode != YMDisplayProfileEditorModeRename;
+    YMDisplayProfileDraft *normalized = [draft normalizedCopyValidatingDisplaySettings:validateSettings error:error];
+    if (!normalized) return NO;
+    YMManagedDisplay *target = nil;
+    if (mode == YMDisplayProfileEditorModeCreate) {
+        NSUInteger next = 1;
+        for (YMManagedDisplay *profile in self.displayProfiles) next = MAX(next, profile.ordinal + 1);
+        if (next > UINT16_MAX) {
+            [self failProfileRequest:error message:@"已达到可用的屏幕编号上限。"];
+            return NO;
+        }
+        ordinal = next;
+    } else {
+        target = [self profileWithOrdinal:ordinal];
+        if (!target || ![self.displayProfiles containsObject:target]) {
+            [self failProfileRequest:error message:@"未找到要编辑的虚拟屏。"];
+            return NO;
+        }
+        if (mode == YMDisplayProfileEditorModeEdit && target.display.isCreated) {
+            [self failProfileRequest:error message:@"运行中的虚拟屏请先关闭后再修改显示设置。"];
+            return NO;
+        }
+    }
+    self.profileEditorCommitInProgress = YES;
+    @try {
+        if (mode == YMDisplayProfileEditorModeCreate) {
+            NSUInteger height = normalized.width == 2560 ? 1440 : 1080;
+            YMManagedDisplay *created = [self newProfileWithOrdinal:ordinal name:normalized.name
+                width:normalized.width height:height hiDPI:normalized.hiDPI];
+            [self.displayProfiles addObject:created];
+            [self saveDisplayProfiles];
+            [self selectProfile:created];
+            if (self.selectedProfile == created)
+                [self createSelectedProfilePersistingOnSuccess:NO];
+            return YES;
+        }
+        if (mode == YMDisplayProfileEditorModeRename) {
+            target.friendlyName = normalized.name;
+            [self saveDisplayProfiles];
+            [self updateInventory];
+            self.statusLabel.stringValue = @"名称已保存";
+            self.detailLabel.stringValue = target.display.isCreated
+                ? @"界面中的名称已更新；系统显示器名称将在这块虚拟屏下次启动时更新。"
+                : @"下次启动这块虚拟屏时会使用新名称。";
+            return YES;
+        }
+        target.friendlyName = normalized.name;
+        target.width = normalized.width;
+        target.height = normalized.width == 2560 ? 1440 : 1080;
+        target.hiDPI = normalized.hiDPI;
+        [self saveDisplayProfiles];
+        [self updateInventory];
+        self.statusLabel.stringValue = @"设置已保存";
+        self.detailLabel.stringValue = @"启动这块虚拟屏时会使用新的名称与显示设置。";
+        return YES;
+    } @finally {
+        self.profileEditorCommitInProgress = NO;
+    }
+}
+- (BOOL)startSavedProfileWithOrdinal:(NSUInteger)ordinal error:(NSError **)error {
+    if (![self profileActionsAvailableForEditor:nil]) {
+        [self failProfileRequest:error message:@"当前无法启动虚拟屏，请稍后重试。"];
+        return NO;
+    }
+    YMManagedDisplay *profile = [self profileWithOrdinal:ordinal];
+    if (!profile || ![self.displayProfiles containsObject:profile] || profile.display.isCreated || profile.starting) {
+        [self failProfileRequest:error message:@"未找到可启动的虚拟屏。"];
+        return NO;
+    }
+    [self selectProfile:profile];
+    if (self.selectedProfile != profile) {
+        [self failProfileRequest:error message:@"当前无法启动虚拟屏，请稍后重试。"];
+        return NO;
+    }
+    [self createSelectedProfilePersistingOnSuccess:NO];
+    return profile.starting || profile.display.isCreated || profile.topologyVerified
+        || self.displayOperationInProgress || self.topologyRecoverySnapshot != nil
+        || profile.startFailureText.length > 0;
+}
+- (NSArray<YMSavedDisplayProfileRow *> *)savedProfileRows {
+    BOOL available = [self profileActionsAvailableForEditor:nil];
+    BOOL recoveryPending = self.topologyRecoverySnapshot != nil;
+    NSMutableArray<YMSavedDisplayProfileRow *> *rows = [NSMutableArray array];
+    for (YMManagedDisplay *profile in self.displayProfiles) {
+        if (profile.display.isCreated) continue;
+        NSString *detail = [NSString stringWithFormat:@"%lu × %lu%@",
+            (unsigned long)profile.width, (unsigned long)profile.height,
+            profile.hiDPI ? @" · HiDPI" : @""];
+        NSString *message = @"";
+        if (profile.starting) message = @"启动中…";
+        else if (recoveryPending) message = @"显示排列待恢复，请先使用恢复入口。";
+        else if (profile.startFailureText.length) message = profile.startFailureText;
+        BOOL actionable = available && !profile.starting && !recoveryPending;
+        [rows addObject:[[YMSavedDisplayProfileRow alloc] initWithOrdinal:profile.ordinal
+            name:[self titleForProfile:profile] detail:detail message:message
+            starting:profile.starting canStart:actionable canEdit:actionable]];
+    }
+    return rows;
+}
+- (NSString *)profileActivityText {
+    for (YMManagedDisplay *profile in self.displayProfiles) {
+        if (!profile.starting) continue;
+        if (profile.display.isCreated && !profile.topologyVerified)
+            return [NSString stringWithFormat:@"%@ 核验中…", profile.friendlyName];
+        return [NSString stringWithFormat:@"%@ 启动中…", profile.friendlyName];
+    }
+    if (self.topologyRecoverySnapshot) return @"显示排列待恢复，请先使用恢复入口。";
+    if (self.profileStartRejectionText.length) return self.profileStartRejectionText;
+    return @"";
 }
 - (void)create:(id)sender {
     (void)sender;
-    if (self.previewMode || self.virtualDisplay.isCreated || !self.selectedProfile || self.displayOperationInProgress || self.appOperationInProgress
-        || self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested) return;
+    [self createSelectedProfilePersistingOnSuccess:YES];
+}
+- (void)createSelectedProfilePersistingOnSuccess:(BOOL)persistOnSuccess {
+    if (self.previewMode || self.updateWorkspaceBusy || self.topologyRecoverySnapshot || self.virtualDisplay.isCreated || !self.selectedProfile
+        || self.displayOperationInProgress || self.appOperationInProgress || self.armed || self.preparing
+        || self.restoring || self.layoutChangedForTrial || self.recoveryRequested) return;
     YMManagedDisplay *profile = self.selectedProfile;
-    NSArray<NSDictionary *> *before = DisplaySnapshot();
-    CGDirectDisplayID previousMain = CGMainDisplayID();
-    if (!YMDesktopRightEdge(before)) {
-        self.detailLabel.stringValue = @"没有可用的桌面排列，暂时无法创建工作屏。"; return;
-    }
+    profile.topologyVerified = NO;
+    profile.starting = YES;
+    profile.startFailureText = nil;
     self.displayOperationInProgress = YES;
+    [self updateInventory];
     NSError *error = nil;
-    if (![profile.display createWithWidth:profile.width height:profile.height hiDPI:profile.hiDPI
-                     name:[self titleForProfile:profile] error:&error]) {
+    YMDisplayTopologySnapshot *before = [self.displayTopology captureSnapshotWithError:&error];
+    if (!before) {
+        profile.starting = NO;
+        profile.startFailureText = @"无法读取显示配置，请重试。";
+        self.pendingProfileRevealOrdinal = @(profile.ordinal);
         self.displayOperationInProgress = NO;
-        self.statusLabel.stringValue = @"虚拟屏创建失败";
-        [self reportApplicationError:error fallback:@"系统未能创建这个虚拟屏。"];
+        [self reportTopologyError:error];
         [self updateInventory];
         return;
     }
-    [self powerAssertions:YES];
-    if (self.systemAssertion == kIOPMNullAssertionID || self.displayAssertion == kIOPMNullAssertionID) {
-        self.displayOperationInProgress = NO;
-        [self stop:nil];
-        self.statusLabel.stringValue = @"保持唤醒请求失败，未启用关屏";
-        return;
-    }
-    [self placeDisplay:profile.display afterSnapshot:before mainDisplay:previousMain];
-    [self saveDisplayProfiles];
-    self.statusLabel.stringValue = [NSString stringWithFormat:@"%@ 已启动", [self titleForProfile:profile]];
-    // WindowServer can restore a cached origin shortly after creation. Capture
-    // this exact object, never whichever profile the user selects next.
-    VDVirtualDisplay *createdDisplay = profile.display;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        if (createdDisplay.isCreated && !self.armed && !self.preparing) {
-            if (![self placeDisplay:createdDisplay afterSnapshot:before mainDisplay:previousMain])
-                self.detailLabel.stringValue = @"虚拟屏已创建，但恢复创建前的排列未完成。请在系统显示器设置中确认。";
-        }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4), dispatch_get_main_queue(), ^{
-            if (createdDisplay.isCreated && ![self layoutMatchesSnapshot:before mainDisplay:previousMain appended:createdDisplay]) {
-                self.statusLabel.stringValue = @"工作屏已创建 · 排列需要检查";
-                self.detailLabel.stringValue = @"未能确认原有屏幕位置与主屏保持不变。请先检查系统显示器排列，再移入应用。";
+    BOOL created = [profile.display createWithWidth:profile.width height:profile.height hiDPI:profile.hiDPI
+                     name:[self titleForProfile:profile] error:&error];
+    CGDirectDisplayID createdID = profile.display.displayID;
+    NSUInteger width = profile.width, height = profile.height;
+    BOOL hiDPI = profile.hiDPI;
+    YMDisplayTopology *topology = self.displayTopology;
+    void (^completeCreation)(BOOL, NSError *) = ^(BOOL configured, NSError *configurationError) {
+        BOOL powerFailed = NO;
+        if (configured) {
+            [self powerAssertions:YES];
+            configured = self.systemAssertion != kIOPMNullAssertionID && self.displayAssertion != kIOPMNullAssertionID;
+            if (!configured) {
+                powerFailed = YES;
+                configurationError = [NSError errorWithDomain:YMDisplayTopologyErrorDomain code:50
+                    userInfo:@{NSLocalizedDescriptionKey:@"保持唤醒请求失败，已取消创建工作屏。"}];
             }
-            self.displayOperationInProgress = NO;
-            [self updateInventory];
-        });
-    });
-    self.detailLabel.stringValue = @"把应用图标拖进屏幕；点击屏幕的「…」可命名或关闭。";
-    [self updateInventory];
+        }
+        if (!configured) {
+            // Only this operation's frozen owned object is removed. The main
+            // event loop stays available while WindowServer removes it.
+            BOOL createFailed = !profile.display.isCreated && createdID == 0 && !powerFailed;
+            NSString *stageFailure = powerFailed ? @"无法保持图形桌面唤醒，已取消启动。"
+                : (createFailed ? @"无法创建虚拟屏，请确认当前系统支持该功能。"
+                                : @"显示配置核验失败，已恢复原排列；可重试。");
+            if (profile.display.isCreated) [profile.display destroy];
+            [self recoverTopology:before removedID:createdID completion:^(BOOL recovered, NSError *recoveryError) {
+                if (![self activeProfiles].count) [self powerAssertions:NO];
+                profile.starting = NO;
+                profile.startFailureText = recovered ? stageFailure : @"显示排列待恢复，请先使用恢复入口。";
+                self.pendingProfileRevealOrdinal = @(profile.ordinal);
+                self.displayOperationInProgress = NO;
+                [self reportTopologyError:recovered ? configurationError : recoveryError];
+                [self updateInventory];
+            }];
+            return;
+        }
+        profile.topologyVerified = YES;
+        profile.starting = NO;
+        profile.startFailureText = nil;
+        if (persistOnSuccess) [self saveDisplayProfiles];
+        self.displayOperationInProgress = NO;
+        self.statusLabel.stringValue = [NSString stringWithFormat:@"%@ 已启动", [self titleForProfile:profile]];
+        self.detailLabel.stringValue = @"扩展模式与原有显示配置已核对，可以移入应用。";
+        [self updateInventory];
+    };
+    if (!created) { completeCreation(NO, error); return; }
+    [self performTopologyOperation:^BOOL(NSError **operationError) {
+        return [topology configureAndVerifyNewDisplay:createdID width:width height:height hiDPI:hiDPI baseline:before error:operationError];
+    } completion:completeCreation];
 }
 - (BOOL)writeStateEnding:(BOOL)end {
     if (self.previewMode) return NO;
@@ -1158,8 +1961,8 @@ static NSView *YMSpacer(void) {
 - (void)startTrial:(id)sender {
     if (self.previewMode) return;
     (void)sender;
-    if ([self activeProfiles].count != 1 || self.displayOperationInProgress || self.appOperationInProgress || self.armed || self.preparing || self.restoring || self.recoveryRequested || self.layoutChangedForTrial
-        || !self.virtualDisplay.isCreated || !ADDisplayActive(self.virtualDisplay.displayID)) return;
+    if (self.updateWorkspaceBusy || [self activeProfiles].count != 1 || self.displayOperationInProgress || self.appOperationInProgress || self.armed || self.preparing || self.restoring || self.recoveryRequested || self.layoutChangedForTrial
+        || ![self canMoveIntoProfile:self.selectedProfile]) return;
     CGDirectDisplayID target = [self.physicalChoice.selectedItem.representedObject unsignedIntValue];
     if (!target || target == self.virtualDisplay.displayID || [VDVirtualDisplay isVirtualDisplay:target]) return;
     if (CGDisplayIsInMirrorSet(target)) {
@@ -1292,7 +2095,7 @@ static NSView *YMSpacer(void) {
 - (void)tick:(NSTimer *)timer {
     if (self.previewMode) return;
     (void)timer;
-    if (self.appOperationInProgress || self.displayOperationInProgress) return;
+    if (self.updateWorkspaceBusy || self.appOperationInProgress || self.displayOperationInProgress) return;
     NSError *windowError = nil;
     self.appOperationInProgress = YES;
     @try {
@@ -1319,11 +2122,16 @@ static NSView *YMSpacer(void) {
 - (BOOL)restoreApplicationsForDisplayID:(CGDirectDisplayID)displayID {
     if (self.appOperationInProgress) return NO;
     self.appOperationInProgress = YES;
+    BOOL restored = NO;
     @try {
     [self updateInventory];
+    // World-changing steps first (WeChat restore / control-panel move). Their
+    // CG signature or TTL impact must settle before the ready gate that
+    // authorizes restoreDisplayID. Do not restore/move inside the wait.
     BOOL ownsPendingWeChat = self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay && self.wechatDisplayID == displayID;
     if (ownsPendingWeChat) {
-        [self.windowRecovery refreshWithVirtualDisplayID:displayID displaySnapshot:DisplaySnapshot()];
+        [self.windowRecovery refreshWithVirtualDisplayID:displayID
+                                       displaySnapshot:[self controllerDisplaySnapshot]];
         NSError *error = nil;
         if (![self.windowRecovery restoreWeChat:&error]) {
             [self reportApplicationError:error fallback:@"微信尚未返回实体屏；保留这个虚拟屏。"];
@@ -1350,6 +2158,14 @@ static NSView *YMSpacer(void) {
         [self.window setFrame:frame display:YES];
         [self updateInventory];
     }
+    BOOL inventoryReady = WaitUntil(^BOOL{
+        [self updateInventory];
+          return [self.appWorkspace inventoryReadyForClosingDisplayID:displayID];
+    }, 1.5);
+    if (!inventoryReady) {
+        [self reportApplicationError:nil fallback:@"窗口清单尚未核对完成，已保留这个虚拟屏。请稍后重试关闭。"];
+        return NO;
+    }
     NSError *error = nil;
     if (![self.appWorkspace restoreDisplayID:displayID error:&error]) {
         [self reportApplicationError:error fallback:@"有应用窗口未能返回实体屏；保留这个虚拟屏。"];
@@ -1361,12 +2177,14 @@ static NSView *YMSpacer(void) {
         [self updateInventory];
         return ![self.appWorkspace needsRestoreForDisplayID:displayID];
     }, 1.5);
-    if (!emptied) {
+      if (!emptied) {
         [self reportApplicationError:nil fallback:@"仍有应用窗口或窗口清单尚未更新，已保留这个虚拟屏。请稍后重试关闭。"];
         return NO;
-    }
-    return YES;
-    } @finally {
+      }
+      restored = YES;
+      return YES;
+      } @finally {
+          if (!restored) [self.appWorkspace cancelUnmovableWindowAllowances];
         self.appOperationInProgress = NO;
         [self updateInventory];
     }
@@ -1374,12 +2192,21 @@ static NSView *YMSpacer(void) {
 }
 - (void)stop:(id)sender {
     (void)sender;
-    if (self.previewMode || self.displayOperationInProgress || self.appOperationInProgress) return;
+    if (self.previewMode) return;
+    if (self.updateWorkspaceBusy || self.displayOperationInProgress || self.appOperationInProgress) {
+        [self logQuitStep:@"close skipped: another operation is running"]; return;
+    }
+    if (self.topologyRecoverySnapshot) { [self logQuitStep:@"close retries display recovery"]; [self retryTopologyRecovery:nil]; return; }
     if (self.armed || self.preparing || self.layoutChangedForTrial) [self restore:nil];
-    if (self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested) return;
+    if (self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested) {
+        [self logQuitStep:@"close skipped: screen-off trial still restoring"]; return;
+    }
     VDVirtualDisplay *closing = self.virtualDisplay;
-    if (!closing.isCreated) return;
-    if (![self restoreApplicationsForDisplayID:closing.displayID]) return;
+    if (!closing.isCreated) { [self logQuitStep:@"close skipped: selected screen is not running"]; return; }
+    if (![self confirmUnmovableWindowsOnDisplayIDs:@[@(closing.displayID)]]) return;
+    if (![self restoreApplicationsForDisplayID:closing.displayID]) {
+        [self logQuitStep:@"close stopped: windows did not return to the physical screen"]; return;
+    }
     BOOL physicalActive = NO;
     for (NSDictionary *item in DisplaySnapshot()) {
         CGDirectDisplayID ident = [item[@"displayID"] unsignedIntValue];
@@ -1392,53 +2219,153 @@ static NSView *YMSpacer(void) {
         self.originalMain = 0;
         mainReady = [self setVirtualMain:NO];
     }
-    if (!mainReady) {
+      if (!mainReady) {
+          [self.appWorkspace cancelUnmovableWindowAllowances];
         self.statusLabel.stringValue = @"保留虚拟屏：尚无可用的实体主屏";
         self.detailLabel.stringValue = @"请先打开或重新连接实体显示器，再关闭或退出。";
+        [self logQuitStep:@"close stopped: no physical main display"];
         return;
     }
     self.displayOperationInProgress = YES;
+    NSError *topologyError = nil;
+    YMDisplayTopologySnapshot *before = [self.displayTopology captureSnapshotWithError:&topologyError];
+    CGDirectDisplayID removedID = closing.displayID;
+    YMDisplayTopologySnapshot *survivors = [before snapshotByExcludingDisplayID:removedID];
+      if (!survivors) {
+          [self.appWorkspace cancelUnmovableWindowAllowances];
+        self.displayOperationInProgress = NO;
+        [self reportTopologyError:topologyError];
+        [self logQuitStep:@"close stopped: display arrangement snapshot failed"];
+        return;
+    }
+    [self logQuitStep:[NSString stringWithFormat:@"closing screen %u", removedID]];
     [self finishWatchdog];
+    self.selectedProfile.topologyVerified = NO;
     [closing destroy];
-    self.displayOperationInProgress = NO;
-    if (![self activeProfiles].count) [self powerAssertions:NO];
-    if (self.wechatDisplayID && ![self profileForDisplayID:self.wechatDisplayID]) self.wechatDisplayID = 0;
-    self.statusLabel.stringValue = @"所选虚拟屏已关闭";
-    self.detailLabel.stringValue = @"其他工作屏继续运行。已关闭的屏幕保留名称，可再次启动。";
-    [self updateInventory];
+    [self recoverTopology:survivors removedID:removedID completion:^(BOOL recovered, NSError *recoveryError) {
+        self.displayOperationInProgress = NO;
+        if (![self activeProfiles].count) [self powerAssertions:NO];
+        if (self.wechatDisplayID && ![self profileForDisplayID:self.wechatDisplayID]) self.wechatDisplayID = 0;
+        if (!recovered) [self reportTopologyError:recoveryError];
+        else {
+            self.statusLabel.stringValue = @"所选虚拟屏已关闭";
+            self.detailLabel.stringValue = @"其他工作屏继续运行。已关闭的屏幕保留名称，可再次启动。";
+        }
+        [self updateInventory];
+        [self resumeTerminationAfterTopologyRecovery:recovered];
+    }];
 }
-- (void)quit:(id)sender { (void)sender; [NSApp terminate:nil]; }
+- (void)storeUpdatePanelState {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setObject:NSStringFromRect(self.window.frame) forKey:@"UpdatePanelFrame"];
+    [defaults setBool:self.window.visible forKey:@"UpdatePanelWasVisible"];
+    [defaults synchronize];
+}
+- (void)quit:(id)sender {
+    (void)sender;
+    if (self.profileEditor || self.window.attachedSheet) return;
+    [NSApp terminate:nil];
+}
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     if (self.previewMode) return NSTerminateNow;
     (void)sender;
-    if (self.displayOperationInProgress || self.appOperationInProgress) return NSTerminateCancel;
+    if (self.automaticUpdater.installationPending) {
+        NSError *error = nil;
+        if (!self.automaticUpdater.installationAuthorized || ![self.updateRecovery commitPreparedRestart:&error]) {
+            self.updateWorkspaceBusy = NO;
+            [self.automaticUpdater installationWasDeferredWithError:error ?: [NSError errorWithDomain:YMAutomaticUpdaterErrorDomain code:104 userInfo:@{NSLocalizedDescriptionKey:@"窗口已变化，点击检查更新以重新保存位置后安装。"}]];
+            [self updateInventory];
+            [self refreshUpdateUI];
+            return [self refuseTermination:@"update installation was deferred"];
+        }
+        [self storeUpdatePanelState];
+        [self writeStateEnding:YES];
+        // The short-lived restart journal owns exact restoration. Do not run
+        // ordinary quit's return-all-to-physical-display workflow here.
+        return NSTerminateNow;
+    }
+    if (self.updateWorkspaceBusy || self.displayOperationInProgress || self.appOperationInProgress)
+        return [self refuseTermination:@"another operation is running"];
+    if (self.topologyRecoverySnapshot) {
+        self.terminationAfterTopologyRecovery = YES; [self retryTopologyRecovery:nil];
+        return [self refuseTermination:@"display recovery is pending; retrying it first"];
+    }
     if (self.armed || self.preparing || self.layoutChangedForTrial) [self restore:nil];
-    if (self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested) return NSTerminateCancel;
+    if (self.armed || self.preparing || self.restoring || self.layoutChangedForTrial || self.recoveryRequested)
+        return [self refuseTermination:@"screen-off trial still restoring"];
     NSArray<YMManagedDisplay *> *active = [self activeProfiles];
+    [self logQuitStep:[NSString stringWithFormat:@"quit requested with %lu running screen(s)", (unsigned long)active.count]];
+    NSMutableArray<NSNumber *> *activeIDs = [NSMutableArray array];
+    for (YMManagedDisplay *profile in active) [activeIDs addObject:@(profile.display.displayID)];
+    if (![self confirmUnmovableWindowsOnDisplayIDs:activeIDs])
+        return [self refuseTermination:@"the user kept the screens because of windows that cannot return"];
     // Restore every workspace before removing any; a failure leaves the whole
     // virtual topology available for manual recovery.
     for (YMManagedDisplay *profile in active) {
         if (![self restoreApplicationsForDisplayID:profile.display.displayID]) {
-            [self showWindow:nil]; return NSTerminateCancel;
+            [self showWindow:nil];
+            return [self refuseTermination:[NSString stringWithFormat:@"windows on screen %u did not return", profile.display.displayID]];
         }
     }
-    for (YMManagedDisplay *profile in active) {
+    if (active.count) {
+        YMManagedDisplay *profile = active.firstObject;
         [self selectProfile:profile];
+        self.terminationAfterTopologyRecovery = YES;
         [self stop:nil];
-        if (profile.display.isCreated) { [self showWindow:nil]; return NSTerminateCancel; }
+        // Successful asynchronous recovery resumes the quit sequence for the
+        // remaining outputs. Failure leaves the app and recovery controls alive.
+        if (!self.displayOperationInProgress) {
+            self.terminationAfterTopologyRecovery = NO;
+            if (profile.display.isCreated || self.topologyRecoverySnapshot) [self showWindow:nil];
+            return [self refuseTermination:@"the first screen could not be closed"];
+        }
+        // Not a refusal: removal is asynchronous and quit resumes afterwards.
+        return NSTerminateCancel;
     }
-    if (self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay) { [self showWindow:nil]; return NSTerminateCancel; }
+    if (self.windowRecovery.needsRestoreBeforeRemovingVirtualDisplay) {
+        [self showWindow:nil];
+        return [self refuseTermination:@"WeChat must return to the physical screen first"];
+    }
     [self writeStateEnding:YES];
     return NSTerminateNow;
 }
 - (void)applicationWillTerminate:(NSNotification *)notification {
     if (self.previewMode) return;
     (void)notification;
+    [self.panelPresenter invalidate];
+    [self.inputLeases stop];
     [NSNotificationCenter.defaultCenter removeObserver:self];
     [self.heartbeatTimer invalidate];
     if (self.hotkey) UnregisterEventHotKey(self.hotkey);
     if (self.keyHandler) RemoveEventHandler(self.keyHandler);
     [self powerAssertions:NO];
+}
+- (void)installPreviewProfilesForState:(NSString *)state {
+    self.displayProfiles = [NSMutableArray array];
+    if ([state isEqualToString:@"running"] || [state isEqualToString:@"multi"] || [state isEqualToString:@"trial"]) {
+        YMManagedDisplay *codex = [self newProfileWithOrdinal:1 name:@"Codex" width:1920 height:1080 hiDPI:NO];
+        YMPreviewFixtureDisplay *codexDisplay = [YMPreviewFixtureDisplay new];
+        codexDisplay.fixtureID = 902;
+        codexDisplay.live = YES;
+        codex.display = codexDisplay;
+        codex.topologyVerified = YES;
+        [self.displayProfiles addObject:codex];
+    }
+    if ([state isEqualToString:@"multi"]) {
+        YMManagedDisplay *grok = [self newProfileWithOrdinal:2 name:@"GrokBot" width:1920 height:1080 hiDPI:YES];
+        YMPreviewFixtureDisplay *grokDisplay = [YMPreviewFixtureDisplay new];
+        grokDisplay.fixtureID = 903;
+        grokDisplay.live = YES;
+        grok.display = grokDisplay;
+        grok.topologyVerified = YES;
+        [self.displayProfiles addObject:grok];
+        YMManagedDisplay *extra = [self newProfileWithOrdinal:3 name:@"Codex · Blender" width:2560 height:1440 hiDPI:NO];
+        YMPreviewFixtureDisplay *stoppedDisplay = [YMPreviewFixtureDisplay new];
+        stoppedDisplay.fixtureID = 904;
+        stoppedDisplay.live = NO;
+        extra.display = stoppedDisplay;
+        [self.displayProfiles addObject:extra];
+    }
 }
 @end
 
@@ -1633,6 +2560,7 @@ static NSArray<NSDictionary *> *UIPreviewSnapshot(BOOL created, BOOL trial, BOOL
         @"logicalWidth":@1920, @"logicalHeight":@1080, @"isMain":@NO, @"isVirtual":@YES, @"isActive":@YES, @"isOnline":@YES}];
     return displays;
 }
+
 static int PreviewUI(NSString *path, NSString *state, BOOL dark) {
     if (![@[@"empty", @"running", @"multi", @"trial"] containsObject:state]) {
         fprintf(stderr, "Preview state must be empty, running, multi, or trial.\n");
@@ -1646,12 +2574,13 @@ static int PreviewUI(NSString *path, NSString *state, BOOL dark) {
     controller.previewMode = YES;
     controller.previewState = state;
     controller.previewSnapshot = UIPreviewSnapshot(![state isEqualToString:@"empty"], [state isEqualToString:@"trial"], [state isEqualToString:@"multi"]);
+    [controller installPreviewProfilesForState:state];
     [controller buildWindow];
     controller.window.appearance = appearance;
     [controller updateInventory];
     NSView *content = controller.window.contentView;
     [content layoutSubtreeIfNeeded];
-    [controller.window setContentSize:NSMakeSize(1000, 410)];
+    [controller.window setContentSize:NSMakeSize(1000, 620)];
     [content layoutSubtreeIfNeeded];
     // Native controls may settle their internal layers on a later run-loop turn.
     // Only this hidden fixture window exists in the preview process.
@@ -1695,12 +2624,16 @@ int main(int argc, const char *argv[]) {
                 @"physicalDisplaySwitchAPI":@(EnableAPI() != NULL), @"displays":DisplaySnapshot()}, includeIdentifiers).UTF8String);
             return 0;
         }
+        if (argc > 1 && strcmp(argv[1], "--input") == 0) return YMInputLeaseCommand(argc, argv);
         if (argc > 2 && strcmp(argv[1], "--self-test") == 0)
             return SelfTest([NSString stringWithUTF8String:argv[2]], argc > 3 && strcmp(argv[3], "hidpi") == 0);
         if (argc > 3 && strcmp(argv[1], "--watchdog-test") == 0)
             return WatchdogTest([NSString stringWithUTF8String:argv[2]], [NSString stringWithUTF8String:argv[3]]);
         [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        // The interactive app needs a regular identity for independent Stage
+        // Manager grouping. Keep LSUIElement for the noninteractive modes above;
+        // panel open/close then manages Dock presence for the normal app.
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         ADController *controller = [[ADController alloc] init];
         NSApp.delegate = controller;
         [NSApp run];

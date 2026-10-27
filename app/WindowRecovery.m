@@ -262,7 +262,18 @@ static NSError *YMRecoveryError(NSInteger code, NSString *message) {
     return YES;
 }
 
+- (BOOL)virtualDestinationStillUsable:(NSDictionary *)display {
+    CGDirectDisplayID targetID = [display[@"displayID"] unsignedIntValue];
+    if (targetID != self.virtualDisplayID) return YES; // Recovery to the user's physical screen stays available.
+    if (!CGDisplayIsOnline(targetID) || !CGDisplayIsActive(targetID) || CGDisplayIsInMirrorSet(targetID)
+        || CGDisplayMirrorsDisplay(targetID) != kCGNullDirectDisplay) return NO;
+    CGRect bounds = CGDisplayBounds(targetID);
+    return CGRectEqualToRect(bounds, CGRectMake([display[@"bounds"][@"x"] doubleValue],
+        [display[@"bounds"][@"y"] doubleValue], [display[@"bounds"][@"width"] doubleValue], [display[@"bounds"][@"height"] doubleValue]));
+}
 - (BOOL)placeWindow:(id)window frame:(NSDictionary *)frame display:(NSDictionary *)display error:(NSError **)error {
+    if (![self virtualDestinationStillUsable:display])
+        return [self fail:error code:17 message:@"虚拟屏显示配置已变化；已停止移入窗口。" pause:YES];
     AXUIElementRef element = YMElement(window);
     NSDictionary *current = YMWindowFrame(window);
     pid_t PID = 0;
@@ -290,6 +301,8 @@ static NSError *YMRecoveryError(NSInteger code, NSString *message) {
         @"x": @([frame[@"x"] doubleValue] - [bounds[@"x"] doubleValue]),
         @"y": @([frame[@"y"] doubleValue] - [bounds[@"y"] doubleValue]),
         @"width": resized[@"width"], @"height": resized[@"height"]}, display);
+    if (![self virtualDestinationStillUsable:display])
+        return [self fail:error code:17 message:@"虚拟屏显示配置已变化；已停止移入窗口。" pause:YES];
     CGPoint position = CGPointMake([effective[@"x"] doubleValue], [effective[@"y"] doubleValue]);
     AXValueRef value = AXValueCreate(kAXValueCGPointType, &position);
     AXError result = value ? AXUIElementSetAttributeValue(element, kAXPositionAttribute, value) : kAXErrorFailure;
@@ -302,7 +315,7 @@ static NSError *YMRecoveryError(NSInteger code, NSString *message) {
     NSTimeInterval deadline = NSDate.timeIntervalSinceReferenceDate + 0.6;
     for (NSUInteger observation = 0; observation < 4; observation++) {
         NSDictionary *observed = YMWindowFrame(window);
-        if (!observed) break; // An AX failure pauses immediately, without retry.
+        if (!observed || ![self virtualDestinationStillUsable:display]) break; // Stop if access or topology changed.
         if (YMRecoveryObservedFrameIsAccessible(observed, effective, display)) return YES;
         if (observation == 3 || NSDate.timeIntervalSinceReferenceDate >= deadline) break;
         [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.15]];

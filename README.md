@@ -6,7 +6,7 @@ A work screen for visual agents, designed to let physical screens rest.
 
 The Windows port is in development using WPF and IddCx. See the [Windows build and validation notes](windows/README.md).
 
-[Website](https://yomado.app/) · [Download for Apple Silicon](https://github.com/chekusu/yomado/releases/download/v0.3.3/Yomado-v0.3.3.zip) · [Release notes](https://github.com/chekusu/yomado/releases/tag/v0.3.3) · [简体中文](README.zh-CN.md) · [MIT license](LICENSE)
+[Website](https://yomado.app/) · [Download for Apple Silicon](https://github.com/chekusu/yomado/releases/download/v0.3.7/Yomado.zip) · [Release notes](https://github.com/chekusu/yomado/releases/tag/v0.3.7) · [简体中文](README.zh-CN.md) · [MIT license](LICENSE)
 
 ## See yomado in 60 seconds
 
@@ -44,7 +44,7 @@ For Codex, install the repository's `skills/yomado` folder in `$CODEX_HOME/skill
 - Groups the menu-bar menu by display, with hover submenus listing apps and visible-window counts, and an individual close action.
 - Shows each physical and yomado display in desktop order, scaled to their logical desktop dimensions, with application icons inside each screen. Drag an icon into a virtual display, between virtual displays, or back to a physical display. Windows moved manually are detected too.
 - Accepts a running app’s `.app` bundle from Finder as an explicit move of that app’s ordinary windows.
-- Keeps naming and display settings in each virtual screen’s **…** menu; the **+** menu creates a screen or starts a saved one.
+- Keeps naming and display settings in each virtual screen’s **…** menu; **New Display** opens a configuration sheet, and stopped screens appear below the overview with Start and Edit.
 - Requests that the system and graphical desktop remain awake while virtual displays exist.
 
 The virtual display belongs to your **existing login session**. It is not a separate operating system, user session, or isolated keyboard and mouse. Your agent and your own work share focus and input, so coordinate their use of the desktop. Yomado is not a remote desktop server or an agent: your existing tools still provide viewing, screenshots, and input.
@@ -55,7 +55,7 @@ The virtual display belongs to your **existing login session**. It is not a sepa
 
 *Native control-panel preview with example display data. This image does not validate target-app input or monitor standby.*
 
-The compact panel presents **yomado · 夜窗**, a short tagline, and the screen layout with app icons inside each screen. App names and window counts are available on hover; controls appear as icons and menus. Valid drag targets highlight and their icons gently wiggle; Reduce Motion uses a static highlight. Use a virtual screen’s **…** menu to rename or close it. The menu also shows resolution and HiDPI; close that screen before changing those settings. Saved, closed screens are available from **+**, where you can adjust their settings and start them again.
+The compact panel presents **yomado · 夜窗**, a short tagline, and the screen layout with app icons inside each screen. App names and window counts are available on hover; controls appear as icons and menus. Valid drag targets highlight and their icons gently wiggle; Reduce Motion uses a static highlight. Click “New Display” to name a display and choose its resolution and HiDPI setting before creating and starting it. Saved displays that are not running appear below the overview, with direct Start and Edit actions. Use a running display’s menu to rename or close it; close it before changing resolution or HiDPI. “Add or Start a Virtual Display…” in the menu bar opens the control panel.
 
 A local live test used the application chooser to move Calculator from a physical screen into Codex, then into GrokBot. A fresh screenshot on GrokBot showed the Calculator window, and typing `2 + 3` followed by Return produced `5`. Returning Calculator restored its original window position and size. These checks verify the chooser-based moves, virtual-to-virtual transfer, screenshot, keyboard input and explicit return for that app. A separate test with one virtual display also confirmed that closing it restored Calculator’s original position and size, then removed the virtual display. Direct icon dragging, closing one virtual display while another remains active, and the monitor-off workflow remain unverified.
 
@@ -76,14 +76,14 @@ dist/Yomado.zip
 
 The build script selects the active Xcode or Command Line Tools installation through `xcrun`. Set `YOMADO_DEVELOPER_DIR` to select another developer directory.
 
-The native Apple Silicon build has been verified. The macOS 14 deployment target is a build setting, not a claim that every macOS 14+ system or Intel Mac is supported. An experimental Apple Silicon build is available in [GitHub Releases](https://github.com/chekusu/yomado/releases/tag/v0.3.3), with a SHA-256 checksum. Intel binaries are not supplied. The official v0.3.3 archive is signed by CHEKUSU INC. with Developer ID, notarized by Apple, and includes a stapled notarization ticket. Notarization is separate from Mac App Store review.
+The native Apple Silicon build has been verified. The macOS 14 deployment target is a build setting, not a claim that every macOS 14+ system or Intel Mac is supported. An experimental Apple Silicon build is available in [GitHub Releases](https://github.com/chekusu/yomado/releases/tag/v0.3.7), with a SHA-256 checksum. Intel binaries are not supplied. The official v0.3.7 archive is signed by CHEKUSU INC. with Developer ID, notarized by Apple, and includes a stapled notarization ticket. Notarization is separate from Mac App Store review.
 
 Local builds receive an **ad hoc signature** by default. Setting `YOMADO_SIGNING_IDENTITY` explicitly enables Developer ID Application signing with the hardened runtime and secure timestamps for both the app and its recovery helper. This signing step does not submit the app for notarization. See the [website distribution process](docs/distribution.md) for signing, Apple notarization, stapling and release checks. A release is described as notarized only after Apple accepts that exact build and its final download passes verification. Follow your Mac's normal security policies when choosing whether to run a local build.
 
 ## Use the virtual display
 
 1. Extract the downloaded archive or build from source, then open `Yomado.app`. The panel shows the current physical screens and their visible apps.
-2. Choose **+** and start a saved screen, such as Codex, or create a new one. Use the screen’s **…** menu to rename it for an agent. New virtual screens are appended to the right of the existing layout while physical outputs stay enabled.
+2. Click “New Display”, enter a name, choose resolution and HiDPI, then create and start. Saved screens that are not running appear below the overview—start one directly, or edit its stopped settings. Use a running screen’s **…** menu to rename it for an agent. New virtual screens are appended to the right of the existing layout while physical outputs stay enabled. The app verifies extended mode, original main display, display modes, scale, rotation, positions and mirror relationships before admitting applications. If setup fails, it removes only the new screen and verifies recovery; unverified targets remain unavailable. Existing user mirror groups are preserved.
 3. Drag **only the agent’s application icons** into the desired virtual screen. An icon represents that app’s ordinary windows on the source screen; moving it does not collect the same app’s windows from other screens. You can also move actual windows manually. Dropping a running `.app` from Finder explicitly selects that app’s ordinary windows across screens. Open the app before adding it.
 4. Drag an app’s icon back into a physical screen to return its windows there, or use the icon’s return action. Dragging between physical screens is not provided; move the actual window for that operation. App counts reflect detected visible windows, not measured GPU activity or agent progress. Some apps reject Accessibility window positioning; yomado reports the failure.
 5. Select the virtual screen in your viewing or agent tools, if supported. Verify a fresh target-app screenshot and an actual reversible input action before starting work.
@@ -92,19 +92,37 @@ Keep a physical display as the main display. Adjust the actual display arrangeme
 
 Changing displays, window positions, or scaling can invalidate an agent's saved coordinates. Refresh its screenshot and window state after each change. A successful screenshot does not by itself prove that keyboard or mouse input works.
 
-Keep yomado running while using its displays. Closing the panel leaves the menu-bar app running. Each display has its own app submenu and close action; **Quit yomado** closes all displays. Closing first attempts to return that display’s windows to physical screens and keeps the display if recovery cannot be confirmed. Sibling virtual displays continue running.
+Keep yomado running while using its displays. While its control panel is open, yomado shows a Dock icon and can participate independently in Stage Manager. Closing the panel returns it to menu-bar mode while its background workspaces keep running; reopen the same panel from the menu bar. Minimizing, hiding, or switching to another app does not close the panel, so the Dock icon remains. This behavior does not remove a launcher you have manually pinned to the Dock. Each display has its own app submenu and close action; **Quit yomado** closes all displays. Closing first attempts to return that display’s windows to physical screens and keeps the display if recovery cannot be confirmed. Sibling virtual displays continue running.
 
-For ordinary apps moved through yomado, original placement is held in memory for this run and survives transfers between virtual displays. Dropping back on the original physical display restores that placement. Dropping on a different physical display centers the windows there; manually moved windows without a checkpoint are also centered on the chosen physical display. The icon’s general return action uses the recorded original display, or the current physical main display when no checkpoint exists. Friendly names and resolution preferences are saved locally. Displays are not automatically recreated at login or after a restart. Multiple displays still share keyboard, pointer and focus; they do not give agents independent input sessions.
+For ordinary apps moved through yomado, original placement is held in memory for this run and survives transfers between virtual displays. Dropping back on the original physical display restores that placement. Dropping on a different physical display centers the windows there; manually moved windows without a checkpoint are also centered on the chosen physical display. The icon’s general return action uses the recorded original display, or the current physical main display when no checkpoint exists. Friendly names and resolution preferences are saved locally. Displays are not automatically recreated at login or after an ordinary restart; a verified in-app update restores its saved workspace. Multiple displays still share keyboard, pointer and focus; they do not give agents independent input sessions.
 
 Yomado does not change passwords, lock-screen policy, screen savers, or login settings. Its wake requests do not unlock a Mac. Screenshot and input permissions remain the responsibility of the tools that perform those actions.
 
+## Share the mouse and keyboard
+
+Agents should prefer background input that leaves your pointer, focus and front app alone: Accessibility actions and events delivered to the target app only. Some apps, such as 3D viewports and games, accept only real pointer and keyboard events. For those, an agent can ask yomado first:
+
+```sh
+./dist/Yomado.app/Contents/MacOS/Yomado --input request --agent "Codex" --reason "Orbit the Blender viewport" --seconds 120
+./dist/Yomado.app/Contents/MacOS/Yomado --input status --lease <leaseID>
+./dist/Yomado.app/Contents/MacOS/Yomado --input release --lease <leaseID>
+```
+
+yomado shows the request on the main screen with **允许** and **拒绝**; an unanswered request is refused after 60 seconds. While a lease is active, a notice stays at the top-right of the main screen, "Agent 正在使用你的鼠标键盘", with the agent's name, the time left and a **停止** button. A lease lasts 10 to 600 seconds and ends on release, expiry or Stop. After a release or expiry, yomado puts the pointer and front app back where they were; after Stop it leaves them with you. Each command prints one JSON line; exit status 0 means granted, released, active or idle.
+
+yomado does not post input itself and cannot block an agent's tool. The lease is a permission and a visible notice: the [yomado skill](skills/yomado/SKILL.md) tells agents to check it before each batch of real input and to stop when it ends.
+
 ## Version and updates
 
-The panel footer links to [yomado.app](https://yomado.app/), this GitHub repository and the MIT license, alongside the installed version. Click the refresh icon next to the version, or **Check for Updates…** (`检查更新…`) in the menu-bar menu. The menu bar uses a transparent, monochrome silhouette of the night-window logo that follows the system appearance; the full app icon keeps its dark background.
+The panel footer links to [yomado.app](https://yomado.app/), this GitHub repository and the MIT license, alongside the installed version. Click the refresh icon next to the version, or **Check and Install Updates…** (`检查并安装更新…`) in the menu-bar menu. The menu bar uses a transparent, monochrome silhouette of the night-window logo that follows the system appearance; the full app icon keeps its dark background.
 
 Opening yomado again brings back its control panel, including after closing or minimizing it. Explicitly opening the panel recovers it onto a visible physical screen when one is available, without moving other apps or changing the display layout.
 
-Checking is manual: yomado queries the official GitHub releases list, including experimental prereleases, and offers a link to the newer release. Network errors are shown explicitly with a retry action. No account, telemetry or device identifiers are sent. Checking does not download, install, quit the app or change displays. To install a downloaded version, first save work and return apps from virtual displays, then quit the old copy and open the new one. Virtual displays are not retained across an app restart.
+Automatic updates are enabled by default and can be switched off in the panel or menu bar. The refresh icon and **Check and Install Updates…** use the same in-app flow: download a compatible stable release, verify the signed feed and archive, install it, and reopen yomado. Experimental releases are not installed automatically. No GitHub account or browser download is required. Errors and progress appear in the panel; an update can be cancelled before installation starts.
+
+Before restarting, yomado checkpoints active virtual screens and the exact existing windows inside them, then recreates those screens and restores those windows. It does not save documents or reconnect remote sessions. Dialogs, full-screen/minimized or unidentifiable windows, a pending dedicated WeChat recovery checkpoint, a virtual main display, missing window-control permission, or a changing layout postpone installation while the current app keeps running. After resolving the cause, check again to retry. Physical-display settings and unrelated application windows are not intentionally changed. Recovery refuses replacement windows or a different process, and stops if the display configuration changes. The private, short-lived checkpoint contains only window/process identities and geometry. See [update distribution and verification](docs/AUTOMATIC-UPDATES.md).
+
+Older versions without the in-app updater need one ordinary upgrade to an updater-capable version. Subsequent stable releases can install through yomado.
 
 ## WeChat window recovery (experimental)
 
@@ -148,7 +166,7 @@ bash ./test.sh
 
 These tests check display placement, app/window ownership and recovery geometry, diagnostic redaction, WeChat checkpoint policies, and update checks. Update tests use a simulated network transport to cover version comparison, experimental releases, pagination, duplicate requests and failures without contacting GitHub. They do not exercise private APIs or prove live display configuration or cross-app input.
 
-A separate hidden AppKit layout regression checks screen proportions, top alignment, inventory changes, scrolling and resizing. It requires a macOS WindowServer session, but does not inspect or move real application windows or create displays:
+A separate hidden AppKit layout regression checks screen proportions, top alignment, inventory changes, scrolling and resizing. It also builds the control panel from synthetic displays to check that the overview cards fit the board without scrollers, with overlay and legacy scrollers, and that the window never grows to fit them. It requires a macOS WindowServer session, but does not inspect or move real application windows or create displays:
 
 ```sh
 bash ./scripts/test-layout.sh
@@ -176,6 +194,8 @@ Lifecycle self-tests exercise a temporary virtual display, its dimensions, an ap
 Generated view images are **not** screenshots of Blender, Marvelous Designer, or another target application. Passing these tests does not validate an agent's input, physical monitor standby, energy savings, or unattended operation. Test receipts can contain display metadata; review them before sharing.
 
 ## Implementation
+
+`bridge/YMDisplayTopology.*` handles bounded display transactions and fail-closed verification; synthetic backend tests do not change live displays. DisplayLink hardware compatibility still requires testing on the specific dock, driver and macOS version.
 
 `app/Yomado.m` contains the AppKit app and test entry points. `app/ControlUI.*` and `app/AppWorkspaceView.*` draw the native screen layout, application icons and drag targets; `app/AppWorkspace.*` manages ordinary app window ownership and original placement; `app/WindowRecovery.*` and its pure policy header handle the opt-in WeChat window checkpoint. `app/Watchdog.m` contains the recovery helper; `bridge/VDVirtualDisplay.*` wraps the virtual-display interface. The application namespace is `dev.chekusu.yomado`.
 

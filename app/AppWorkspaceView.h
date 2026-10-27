@@ -10,6 +10,8 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)hasActiveInteraction;
 @property(nonatomic) uint32_t displayID;
 @property(nonatomic) BOOL physicalDisplay;
+// Destination admission is separate from dragging existing windows out for recovery.
+@property(nonatomic) BOOL acceptsApplications;
 @property(nonatomic) CGFloat displayAspectRatio;
 @property(nonatomic, copy) NSString *displayName;
 @property(nonatomic, copy) NSString *displayDetail;
