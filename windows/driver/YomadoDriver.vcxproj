@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{FA43A8ED-764B-4A37-9E7C-0C0CB378AA10}</ProjectGuid>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <WdkRoot>$(ProjectDir)..\packages\Microsoft.Windows.WDK.x64.10.0.26100.6584\c</WdkRoot>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType><PlatformToolset>v143</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)..\artifacts\driver\</OutDir><IntDir>$(ProjectDir)..\artifacts\obj\driver\</IntDir>
+    <TargetName>YomadoDriver</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard><WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError><ExceptionHandling>Sync</ExceptionHandling><RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <PreprocessorDefinitions>UMDF_DRIVER;UMDF_VERSION_MAJOR=2;UMDF_VERSION_MINOR=25;UMDF_USING_NTSTATUS;IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=4;_AMD64_;AMD64;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WdkRoot)\Include\wdf\umdf\2.25;$(WdkRoot)\Include\10.0.26100.0\um\iddcx\1.4;$(WdkRoot)\Include\10.0.26100.0\um;$(WdkRoot)\Include\10.0.26100.0\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <Optimization>MaxSpeed</Optimization><SDLCheck>true</SDLCheck>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(WdkRoot)\Lib\wdf\umdf\x64\2.25;$(WdkRoot)\Lib\10.0.26100.0\um\x64\iddcx\1.4;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>WdfDriverStubUm.lib;iddcxstub.lib;d3d11.lib;dxgi.lib;avrt.lib;ntdll.lib;OneCoreUAP.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="YomadoDriver.cpp" /><ClCompile Include="FrameProcessor.cpp" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CopyDriverManifest" AfterTargets="Build"><Copy SourceFiles="$(ProjectDir)YomadoDriver.inf;$(ProjectDir)LICENSE" DestinationFolder="$(OutDir)" /></Target>
+</Project>

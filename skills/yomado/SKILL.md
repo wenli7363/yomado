@@ -1,9 +1,14 @@
 ---
 name: yomado
-description: "Prepare and manage yomado virtual work screens on macOS using existing computer-use tools. Use when an agent needs to create or name a work screen, move authorized app windows into it, verify visual access, or return those windows after a task."
+description: "Prepare and manage yomado virtual work screens on macOS or Windows using existing computer-use tools. Use when an agent needs to create or name a work screen, move authorized app windows into it, verify visual access, or return those windows after a task."
 ---
 
 # yomado
+
+On Windows, read [the Windows workflow](references/windows.md) and use that
+platform-specific workflow instead of the macOS instructions below. The Windows
+port is a development version; driver installation and signing need separate
+machine-owner authorization.
 
 Let the agent prepare its own work screen; the user does not need to create it manually. Operate the installed yomado app through the agent's existing computer-use tools. This skill supplies the workflow, not a separate screenshot/input tool or management API.
 

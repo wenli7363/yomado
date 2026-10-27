@@ -1,0 +1,33 @@
+<Application x:Class="Yomado.App.App" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" ShutdownMode="OnExplicitShutdown" ThemeMode="System">
+  <Application.Resources>
+    <ResourceDictionary>
+    <ResourceDictionary.MergedDictionaries><ResourceDictionary Source="/PresentationFramework.Fluent;component/Themes/Fluent.xaml" /></ResourceDictionary.MergedDictionaries>
+    <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="MinHeight" Value="32" /><Setter Property="Padding" Value="12,4" />
+      <Setter Property="Background" Value="{DynamicResource ControlBackground}" /><Setter Property="Foreground" Value="{DynamicResource PanelForeground}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ControlBorder}" /><Setter Property="BorderThickness" Value="1" />
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+        <Border x:Name="Chrome" CornerRadius="5" Padding="{TemplateBinding Padding}" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}">
+          <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" RecognizesAccessKey="True" />
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ControlHover}" /></Trigger>
+          <Trigger Property="IsPressed" Value="True"><Setter TargetName="Chrome" Property="Opacity" Value="0.7" /></Trigger>
+          <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" /></Trigger>
+          <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Chrome" Property="Opacity" Value="0.45" /></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <Style x:Key="LinkButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"><Setter Property="Background" Value="Transparent" /><Setter Property="BorderThickness" Value="0" /><Setter Property="Foreground" Value="{DynamicResource MutedForeground}" /></Style>
+    <Style x:Key="IconButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <!-- Apply the symbol font only to the glyph, not to menus/tooltips opened by the button. -->
+      <Setter Property="ContentTemplate"><Setter.Value><DataTemplate>
+        <TextBlock Text="{Binding}" FontFamily="Segoe Fluent Icons" FontSize="16" />
+      </DataTemplate></Setter.Value></Setter>
+      <Setter Property="MinWidth" Value="34" /><Setter Property="Padding" Value="6" />
+    </Style>
+    <Style TargetType="ToolTip"><Setter Property="MaxWidth" Value="360" /></Style>
+    </ResourceDictionary>
+  </Application.Resources>
+</Application>

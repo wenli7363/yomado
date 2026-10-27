@@ -4,6 +4,8 @@
 
 A work screen for visual agents, designed to let physical screens rest.
 
+The Windows port is in development using WPF and IddCx. See the [Windows build and validation notes](windows/README.md).
+
 [Website](https://yomado.app/) · [Download for Apple Silicon](https://github.com/chekusu/yomado/releases/download/v0.3.3/Yomado-v0.3.3.zip) · [Release notes](https://github.com/chekusu/yomado/releases/tag/v0.3.3) · [简体中文](README.zh-CN.md) · [MIT license](LICENSE)
 
 ## See yomado in 60 seconds
