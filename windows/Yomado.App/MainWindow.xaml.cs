@@ -27,14 +27,16 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly bool preview;
     private readonly bool readOnlyProbe;
+    private readonly VirtualDisplayPointerBoundary? pointerBoundary;
     public static readonly uint ActivateMessage = RegisterWindowMessage("Yomado.Windows.ShowPanel");
     private TrayIcon? tray;
     private bool busy, exiting;
     private Point dragStart;
     private Task<UpdateResult>? updateCheck;
 
-    public MainWindow(bool preview = false, bool readOnlyProbe = false)
+    public MainWindow(bool preview = false, bool readOnlyProbe = false, VirtualDisplayPointerBoundary? pointerBoundary = null)
     {
+        this.pointerBoundary = pointerBoundary;
         this.readOnlyProbe = readOnlyProbe;
         this.preview = preview; InitializeComponent(); DataContext = model;
         if (!preview) SourceInitialized += (_, _) => HwndSource.FromHwnd(new WindowInteropHelper(this).Handle)!.AddHook(ThemeMessage);
@@ -60,7 +62,9 @@ public partial class MainWindow : Window
     private void Refresh()
     {
         if (desktop is null || driver is null) return;
-        var displays = desktop.GetDisplays(); var windows = desktop.GetWindows();
+        var displays = desktop.GetDisplays();
+        pointerBoundary?.UpdateDisplays(displays);
+        var windows = desktop.GetWindows();
         var cards = displays.Select(display =>
         {
             var profile = profiles.SingleOrDefault(p => display.IsYomado && p.Slot == display.Slot);
@@ -83,6 +87,9 @@ public partial class MainWindow : Window
         model.SetDriverHealth(health, payload, hint);
         RefreshSavedProfiles(displays);
         Desktop.KeepAwake(displays.Any(display => display.IsYomado));
+        if (displays.Any(display => display.IsYomado) && pointerBoundary is not null &&
+            (pointerBoundary.Error ?? pointerBoundary.GetStatus().ClipError) is { } pointerError)
+            model.Status = "鼠标边界保护异常：" + pointerError;
     }
     private void RefreshSavedProfiles(IReadOnlyList<DisplayInfo> displays)
     {
@@ -101,6 +108,16 @@ public partial class MainWindow : Window
     private static string CardSignature(ScreenCard card) => $"{card.Display}:{card.Title}:{string.Join('|', card.Applications.Select(row => row.Path + ':' + row.WindowCount))}";
     private nint ThemeMessage(nint window, int message, nint wParam, nint lParam, ref bool handled)
     {
+        if (message == 0x7e && pointerBoundary is not null)
+        {
+            // Drop stale pixel bounds immediately during hotplug/rearrangement.
+            pointerBoundary.UpdateDisplays([]);
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (busy || exiting) return;
+                try { Refresh(); } catch (Exception ex) { model.Status = ex.Message; }
+            }));
+        }
         if (message is 0x1a or 0x31a) Dispatcher.BeginInvoke(new Action(() => Palette.Apply()));
         if (message == ActivateMessage && !readOnlyProbe) { ShowPanel(); handled = true; }
         return 0;
@@ -156,8 +173,11 @@ public partial class MainWindow : Window
         DisplayTopology.VerifyAddition(before, desktop.GetDisplays(), profile, requirePosition: false);
         DisplayLayout.Append(added, before, desktop);
         added = DisplayTopology.VerifyAddition(before, desktop.GetDisplays(), profile);
+        pointerBoundary?.UpdateDisplays(desktop.GetDisplays());
         model.Status = profile.HiDpi && Math.Abs(added.Scale - 2) > 0.05 ?
             "虚拟屏已创建，使用 2 倍像素。Windows 缩放可在系统显示设置中调整。" : "虚拟屏已创建，可以移入本次任务的窗口。";
+        if (pointerBoundary is { IsActive: false })
+            model.Status = "虚拟屏已创建，但鼠标边界保护未启用：" + pointerBoundary.Error;
         }
         catch (Exception ex) { profileMessages[profile.Slot] = ex.Message; throw; }
         finally { startingSlot = null; }

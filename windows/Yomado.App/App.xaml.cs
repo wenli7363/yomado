@@ -15,12 +15,14 @@ public partial class App : Application
 {
     private Mutex? instance;
     private InputLeaseService? inputLease;
+    private VirtualDisplayPointerBoundary? pointerBoundary;
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
         Palette.Apply();
         if (InputLeaseCommand.IsCommand(e.Args)) { Shutdown(await InputLeaseCommand.RunAsync(e.Args)); return; }
         if (e.Args.Length == 2 && e.Args[0] == "--test-input-lease") { InputLeaseSmoke.Run(e.Args[1]); return; }
+        if (e.Args.Length == 2 && e.Args[0] == "--test-pointer-boundary") { PointerBoundarySmoke.Run(e.Args[1]); return; }
         if (e.Args.Length is 1 or 2 && e.Args[0] == "--install-driver" && (e.Args.Length == 1 || e.Args[1] == "--trust-local-development"))
         { RunDriverInstaller(e.Args.Length == 2); return; }
         if (e.Args.Length == 2 && e.Args[0] == "--test-driver-setup") { DriverSetupSmoke.Run(e.Args[1]); return; }
@@ -91,12 +93,18 @@ public partial class App : Application
         };
         try
         {
-            MainWindow = new MainWindow(); MainWindow.Show();
-            inputLease = new InputLeaseService(Dispatcher); inputLease.Start();
+            pointerBoundary = new VirtualDisplayPointerBoundary();
+            MainWindow = new MainWindow(pointerBoundary: pointerBoundary); MainWindow.Show();
+            inputLease = new InputLeaseService(Dispatcher) { ReadPointerBoundaryStatus = pointerBoundary.GetStatus };
+            inputLease.VirtualInputAllowanceChanged += pointerBoundary.AllowVirtualInputFor;
+            inputLease.Start();
         }
         catch (Exception ex) { MessageBox.Show(ex.Message, "无法启动 yomado", MessageBoxButton.OK, MessageBoxImage.Error); Shutdown(1); }
     }
-    protected override void OnExit(ExitEventArgs e) { inputLease?.Dispose(); instance?.Dispose(); base.OnExit(e); }
+    protected override void OnExit(ExitEventArgs e)
+    {
+        inputLease?.Dispose(); pointerBoundary?.Dispose(); instance?.Dispose(); base.OnExit(e);
+    }
     private async void RunDriverInstaller(bool approveDevelopmentTrust)
     { Shutdown((int)await DriverInstaller.RunElevatedAsync(AppContext.BaseDirectory, approveDevelopmentTrust)); }
     public static void OpenLink(string target) => Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });

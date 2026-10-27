@@ -23,6 +23,10 @@ if (!$CoreOnly) {
     & $taskDotnet $taskAssembly --test-input-lease $taskLeaseReport
     Assert-YomadoExit 'Read-only input lease IPC smoke test'
     if (!(Get-Content -LiteralPath $taskLeaseReport -Raw | ConvertFrom-Json).passed) { throw 'Input lease IPC smoke test failed.' }
+    $taskPointerReport = Join-Path $PSScriptRoot 'artifacts\pointer-boundary-smoke.json'
+    & $taskDotnet $taskAssembly --test-pointer-boundary $taskPointerReport
+    Assert-YomadoExit 'Read-only pointer hook lifecycle smoke test'
+    if (!(Get-Content -LiteralPath $taskPointerReport -Raw | ConvertFrom-Json).passed) { throw 'Pointer hook lifecycle smoke test failed.' }
     foreach ($taskTheme in @('light','dark')) {
         & $taskDotnet $taskAssembly --preview-ui "$PSScriptRoot\artifacts\preview-$taskTheme.png" $taskTheme
         Assert-YomadoExit "$taskTheme preview"

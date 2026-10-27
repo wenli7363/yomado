@@ -29,6 +29,14 @@ public static class InputLeaseSmoke
             var invalid = await Exchange(pipeName, new("unsupported-action"));
             if (invalid.Status != "invalid") throw new InvalidOperationException("Invalid IPC command was accepted.");
             checks.Add("invalid IPC command is rejected");
+            if ((await Exchange(pipeName, new("pointer-status"))).Status != "not-running")
+                throw new InvalidOperationException("Missing pointer diagnostics were invented.");
+            checks.Add("pointer diagnostics report unavailable without changing input state");
+            service.ReadPointerBoundaryStatus = () => new(true, null, false, 2, 10, 2, 1, 0);
+            var pointer = await Exchange(pipeName, new("pointer-status"));
+            if (pointer.Status != "idle" || pointer.PointerBoundary is not { DisplayCount: 2, ObservedMoves: 10, ConstrainedMoves: 1 })
+                throw new InvalidOperationException("Pointer diagnostic counters were not preserved over IPC.");
+            checks.Add("pointer status reads diagnostic counters without a request or input lease");
             if ((await Exchange(pipeName, new("status"))).Status != "idle") throw new InvalidOperationException("Read-only commands changed lease state.");
             checks.Add("read-only commands leave the service idle");
         }

@@ -155,6 +155,8 @@ Test("null profile entries are safely ignored", () =>
 DisplayTopologyTests.Register(Test);
 ClosePolicyTests.Register(Test);
 InputLeaseTests.Register(Test);
+CursorBoundaryTests.Register(Test);
+PointerClipTests.Register(Test);
 foreach (var (name, run) in tests)
 {
     try { run(); Console.WriteLine($"PASS {name}"); }

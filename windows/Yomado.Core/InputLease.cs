@@ -5,7 +5,8 @@ using System.Text.Json.Serialization;
 namespace Yomado.Core;
 
 public sealed record InputLeaseReply(string Status, string? LeaseID = null, string? Reason = null,
-    int? Seconds = null, double? RemainingSeconds = null, long? ExpiresAt = null, string? Message = null)
+    int? Seconds = null, double? RemainingSeconds = null, long? ExpiresAt = null, string? Message = null,
+    PointerBoundaryStatus? PointerBoundary = null)
 {
     [JsonIgnore] public int ExitCode => Status is "granted" or "active" or "released" or "idle" ? 0 : Status == "not-running" ? 3 : 2;
 }

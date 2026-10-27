@@ -39,7 +39,7 @@ public static class InputLeaseCommand
         try { request = Parse(args); }
         catch (ArgumentException)
         {
-            Console.Error.WriteLine("Usage: Yomado --input request --agent <name> --reason <text> [--seconds <10-600>]\n       Yomado --input status [--lease <id>]\n       Yomado --input release --lease <id>");
+            Console.Error.WriteLine("Usage: Yomado --input request --agent <name> --reason <text> [--seconds <10-600>]\n       Yomado --input status [--lease <id>]\n       Yomado --input release --lease <id>\n       Yomado --input pointer-status");
             return 64;
         }
         InputLeaseReply reply;
@@ -68,14 +68,15 @@ public static class InputLeaseCommand
         var canonical = args[0] == "--input";
         if (canonical && args.Length < 2) throw new ArgumentException();
         var action = canonical ? args[1] : args[0][8..];
-        if (action is not ("request" or "status" or "release")) throw new ArgumentException();
+        if (action is not ("request" or "status" or "release" or "pointer-status")) throw new ArgumentException();
         var options = new Dictionary<string, string>(StringComparer.Ordinal);
         for (var i = canonical ? 2 : 1; i < args.Length; i += 2)
         {
             if (i + 1 >= args.Length || args[i] is not ("--agent" or "--reason" or "--seconds" or "--lease") ||
                 !options.TryAdd(args[i], args[i + 1])) throw new ArgumentException();
         }
-        var allowed = action == "request" ? new[] { "--agent", "--reason", "--seconds" } : new[] { "--lease" };
+        var allowed = action == "request" ? new[] { "--agent", "--reason", "--seconds" } :
+            action == "pointer-status" ? [] : new[] { "--lease" };
         if (options.Keys.Any(k => !allowed.Contains(k))) throw new ArgumentException();
         double? seconds = null;
         if (options.TryGetValue("--seconds", out var raw))

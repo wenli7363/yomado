@@ -22,6 +22,8 @@ public sealed class InputLeaseService : IDisposable
     private InputLeaseWindow? prompt, indicator;
     private InputLeaseControlsSnapshot? controls;
     private bool started, disposed;
+    public event Action<TimeSpan>? VirtualInputAllowanceChanged;
+    public Func<PointerBoundaryStatus>? ReadPointerBoundaryStatus { get; set; }
 
     public InputLeaseService(Dispatcher dispatcher) : this(dispatcher, InputLeaseCommand.PipeName) { }
 
@@ -131,6 +133,9 @@ public sealed class InputLeaseService : IDisposable
         Refresh();
         if (disposed) return Task.FromResult(new InputLeaseReply("not-running"));
         if (request is null) return Task.FromResult(new InputLeaseReply("invalid"));
+        if (request.Action == "pointer-status")
+            return Task.FromResult(ReadPointerBoundaryStatus?.Invoke() is { } pointerStatus ?
+                new InputLeaseReply("idle", PointerBoundary: pointerStatus) : new InputLeaseReply("not-running"));
         if (request.Action == "status") return Task.FromResult(coordinator.Status(request.LeaseID));
         if (request.Action == "release") return Task.FromResult(request.LeaseID is null ? new InputLeaseReply("invalid") : coordinator.Release(request.LeaseID));
         if (request.Action != "request" || request.Agent is null || request.Reason is null)
@@ -168,6 +173,7 @@ public sealed class InputLeaseService : IDisposable
             {
                 indicator = InputLeaseWindow.Indicator(coordinator.Active!.Agent, () => coordinator.Stop());
                 indicator.Show(); indicator.Position(true);
+                VirtualInputAllowanceChanged?.Invoke(TimeSpan.FromSeconds(coordinator.LeaseRemainingSeconds));
             }
             catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
             {
@@ -181,6 +187,7 @@ public sealed class InputLeaseService : IDisposable
 
     private void LeaseEnded(InputLeaseReply reply)
     {
+        VirtualInputAllowanceChanged?.Invoke(TimeSpan.Zero);
         Close(ref indicator);
         try { if (reply.Reason is "released" or "expired") controls?.Restore(); }
         catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception) { }
