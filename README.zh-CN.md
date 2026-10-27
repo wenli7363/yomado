@@ -4,6 +4,8 @@
 
 为视觉 Agent 留一块工作屏，让实体屏可以休息。
 
+Windows 版本正在开发，使用 WPF 和 IddCx。源码、构建方法与当前验证范围见 [Windows 开发说明](windows/README.md)。
+
 [官方网站](https://yomado.app/) · [English](README.md) · [MIT 许可证](LICENSE)
 
 ## 60 秒看懂 yomado

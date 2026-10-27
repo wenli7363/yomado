@@ -18,3 +18,12 @@
 .env.*
 !.env.example
 *.log
+
+# Windows build dependencies and outputs.
+/windows/.tools/
+/windows/packages/
+/windows/artifacts/
+**/bin/
+**/obj/
+*.user
+*.suo
